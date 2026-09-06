@@ -1,8 +1,7 @@
-"""현재 OS용 local_face_recognition 실행 파일을 만든다."""
+"""local_face_recognition의 실행 환경을 준비하고 애플리케이션을 시작한다."""
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import urllib.request
@@ -11,7 +10,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-BUILD_VENV = PROJECT_ROOT / ".build-venv"
+VENV_DIRECTORY = PROJECT_ROOT / ".venv"
 MODELS_DIRECTORY = PROJECT_ROOT / "models"
 MODEL_BUNDLE_URL = (
     "https://github.com/Macfa/local-face-recognition/releases/download/"
@@ -27,27 +26,28 @@ REQUIRED_MODEL_FILES = (
 
 
 def main() -> None:
-    """독립 빌드 환경, 모델 번들, PyInstaller 실행 파일을 순서대로 준비한다."""
-    python = _prepare_build_environment()
+    """실행 환경과 로컬 모델을 준비한 후 대표 애플리케이션을 실행한다."""
+    python = _prepare_runtime_environment()
     _prepare_models()
-    _build_executable(python)
-    print(f"build_complete={PROJECT_ROOT / 'dist'}")
+    _run([str(python), str(PROJECT_ROOT / "local_face_recognition.py")])
 
 
-def _prepare_build_environment() -> Path:
-    """프로젝트와 분리된 빌드 가상환경에 배포 의존성을 설치한다."""
-    if not BUILD_VENV.exists():
-        _run([sys.executable, "-m", "venv", str(BUILD_VENV)])
-    python = BUILD_VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+def _prepare_runtime_environment() -> Path:
+    """프로젝트 전용 가상환경을 만들고 필요한 Python 패키지를 설치한다."""
+    if not VENV_DIRECTORY.exists():
+        print("virtual_environment_create_started=true")
+        _run([sys.executable, "-m", "venv", str(VENV_DIRECTORY)])
+    python = VENV_DIRECTORY / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     _run([str(python), "-m", "pip", "install", "--upgrade", "pip"])
-    _run([str(python), "-m", "pip", "install", "-r", str(PROJECT_ROOT / "requirements.txt"), "pyinstaller"])
+    _run([str(python), "-m", "pip", "install", "-r", str(PROJECT_ROOT / "requirements.txt")])
     return python
 
 
 def _prepare_models() -> None:
-    """GitHub Release 모델 번들을 한 번만 내려받아 빌드 입력으로 준비한다."""
+    """누락된 로컬 모델을 GitHub Release 번들에서 한 번만 준비한다."""
     if all((MODELS_DIRECTORY / relative_path).is_file() for relative_path in REQUIRED_MODEL_FILES):
         return
+
     archive_path = PROJECT_ROOT / ".model-bundle.zip"
     print("models_download_started=true")
     try:
@@ -61,29 +61,14 @@ def _prepare_models() -> None:
             archive.extractall(MODELS_DIRECTORY)
     finally:
         archive_path.unlink(missing_ok=True)
+
     missing = [path for path in REQUIRED_MODEL_FILES if not (MODELS_DIRECTORY / path).is_file()]
     if missing:
         raise RuntimeError(f"Model bundle is incomplete: {', '.join(missing)}")
 
 
-def _build_executable(python: Path) -> None:
-    """현재 OS에서 실행 가능한 PyInstaller 번들을 dist에 생성한다."""
-    separator = ";" if os.name == "nt" else ":"
-    _run(
-        [
-            str(python), "-m", "PyInstaller", "--noconfirm", "--clean",
-            "--name", "local_face_recognition",
-            "--add-data", f"{MODELS_DIRECTORY}{separator}models",
-            "--collect-all", "insightface",
-            "--collect-all", "onnxruntime",
-            "--collect-all", "ultralytics",
-            str(PROJECT_ROOT / "local_face_recognition.py"),
-        ]
-    )
-
-
 def _run(command: list[str]) -> None:
-    """빌드 실패를 즉시 호출자에게 전달한다."""
+    """하위 명령 실패를 즉시 상위 실행자에게 전달한다."""
     subprocess.run(command, cwd=PROJECT_ROOT, check=True)
 
 
