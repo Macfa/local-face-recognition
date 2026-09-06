@@ -8,6 +8,6 @@ __pycache__/
 .venv/
 venv/
 .build-venv/
-.model-bundle.zip
+.insightface-buffalo-l.zip
 data/
 models/

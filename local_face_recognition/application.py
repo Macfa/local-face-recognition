@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 from .components import (
     FaceAnalyzer,
@@ -29,6 +31,61 @@ from .application_services.observation_service import ObservationService
 from .application_services.registration_service import RegistrationService
 from .application_services.face_sample_service import FaceSampleService
 from .infrastructure.local_sqlite_repository import LocalSQLiteRepository
+
+
+_DISPLAY_FONT_PATHS = (
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+    "C:/Windows/Fonts/malgun.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+)
+
+
+@lru_cache(maxsize=8)
+def _display_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """현재 OS에서 한국어를 표시할 수 있는 화면 글꼴을 찾는다."""
+    for path in _DISPLAY_FONT_PATHS:
+        if Path(path).is_file():
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
+
+
+@lru_cache(maxsize=128)
+def _render_unicode_label(text: str, color: Tuple[int, int, int], size: int) -> np.ndarray:
+    """같은 한글 라벨을 매 프레임 다시 렌더링하지 않도록 BGRA 비트맵으로 보관한다."""
+    font = _display_font(size)
+    left, top, right, bottom = font.getbbox(text)
+    image = Image.new("RGBA", (max(1, right - left), max(1, bottom - top)), (0, 0, 0, 0))
+    ImageDraw.Draw(image).text((-left, -top), text, font=font, fill=(color[2], color[1], color[0], 255))
+    return cv2.cvtColor(np.asarray(image), cv2.COLOR_RGBA2BGRA)
+
+
+def _draw_display_label(
+    frame: np.ndarray,
+    text: str,
+    origin: Tuple[int, int],
+    color: Tuple[int, int, int],
+    *,
+    font_scale: float,
+) -> None:
+    """영문은 OpenCV로, 한글이 포함된 라벨은 OS 글꼴 비트맵으로 프레임에 표시한다."""
+    if text.isascii():
+        cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 2)
+        return
+
+    bitmap = _render_unicode_label(text, color, max(14, round(font_scale * 32)))
+    x, baseline_y = origin
+    y = baseline_y - bitmap.shape[0]
+    x0, y0 = max(0, x), max(0, y)
+    x1 = min(frame.shape[1], x + bitmap.shape[1])
+    y1 = min(frame.shape[0], y + bitmap.shape[0])
+    if x0 >= x1 or y0 >= y1:
+        return
+    source = bitmap[y0 - y:y1 - y, x0 - x:x1 - x]
+    target = frame[y0:y1, x0:x1]
+    alpha = source[:, :, 3:4].astype(np.float32) / 255.0
+    target[:] = (source[:, :, :3] * alpha + target * (1.0 - alpha)).astype(np.uint8)
 
 
 @dataclass(frozen=True)
@@ -114,6 +171,7 @@ class VisionApplication:
         self._analysis_faces: Dict[int, _FaceOverlay] = {}
         self._storage_track_ids: Dict[int, int] = {}
         self._registration_requested_tracks: Set[int] = set()
+        self._registration_pending_tracks: Set[int] = set()
         self._registered_names: Dict[int, str] = {}
         self._lost_tracks: Dict[int, _LostTrack] = {}
         self._pending_storage_by_track: Dict[int, int] = {}
@@ -259,12 +317,16 @@ class VisionApplication:
                 continue
             try:
                 print(
-                    f"registration_confirmation_required track_id={request.track_id} "
-                    "input_y_or_n=true",
+                    f"external_identity_confirmed track_id={request.track_id} "
+                    "registration_name_required=true",
                     flush=True,
                 )
-                answer = input(f"Track {request.track_id}을 등록하시겠습니까? (Y/N): ").strip().upper()
-                if answer != "Y":
+                answer = self._read_registration_answer(request.track_id)
+                if answer is None:
+                    self._clear_registration_pending(request.track_id)
+                    print(f"registration_cancelled track_id={request.track_id} reason=stdin_closed", flush=True)
+                    continue
+                if answer == "N":
                     outcome = self._registration_service.respond(
                         request.proposal_id,
                         "",
@@ -273,25 +335,35 @@ class VisionApplication:
                     if outcome.status == "FAILED":
                         print(f"registration_error=RegistrationFailed message={outcome.error}", flush=True)
                         continue
+                    self._clear_registration_pending(request.track_id)
                     print(f"registration_cancelled track_id={request.track_id}", flush=True)
                     continue
-                name = input(f"Track {request.track_id}의 이름을 입력하세요: ")
+                name = self._read_registration_name(request.track_id)
+                if name is None:
+                    self._clear_registration_pending(request.track_id)
+                    print(f"registration_cancelled track_id={request.track_id} reason=stdin_closed", flush=True)
+                    continue
                 outcome = self._registration_service.respond(
                     request.proposal_id,
                     name,
                     datetime.now(timezone.utc),
                 )
                 if outcome.status == "REJECTED":
+                    self._clear_registration_pending(request.track_id)
                     print(f"registration_cancelled track_id={request.track_id}", flush=True)
                     continue
                 if outcome.status == "FAILED":
                     print(f"registration_error=RegistrationFailed message={outcome.error}", flush=True)
                     continue
-                with self._snapshot_lock:
-                    self._registered_names[request.track_id] = outcome.name or ""
+                self._apply_identity(request.track_id, "IDENTIFIED", outcome.name)
+                self._clear_registration_pending(request.track_id)
                 print(
                     f"person_profile=registered track_id={request.track_id} "
                     f"name={outcome.name} template_count=3",
+                    flush=True,
+                )
+                print(
+                    f"camera_overlay_name_applied track_id={request.track_id} name={outcome.name}",
                     flush=True,
                 )
             except EOFError:
@@ -382,7 +454,39 @@ class VisionApplication:
             if track_id in self._registration_requested_tracks:
                 return
             self._registration_requested_tracks.add(track_id)
+            self._registration_pending_tracks.add(track_id)
         self._registration_queue.put(_RegistrationRequest(track_id, storage_track_id, proposal_id))
+
+    def _read_registration_answer(self, track_id: int) -> str | None:
+        """대소문자와 무관하게 유효한 등록 여부 응답이 올 때까지 다시 묻는다."""
+        while not self._stop_requested.is_set():
+            try:
+                answer = input(
+                    f"외부인으로 확인되었습니다. Track {track_id}의 이름을 등록하시겠습니까? (Y/N): "
+                ).strip().casefold()
+            except EOFError:
+                return None
+            if answer in {"y", "n"}:
+                return answer.upper()
+            print("등록 입력이 올바르지 않습니다. Y 또는 N을 입력하세요.", flush=True)
+        return None
+
+    def _read_registration_name(self, track_id: int) -> str | None:
+        """공백이 아닌 이름이 입력될 때까지 등록 대상의 이름을 다시 묻는다."""
+        while not self._stop_requested.is_set():
+            try:
+                name = input(f"Track {track_id}의 이름을 입력하세요: ").strip()
+            except EOFError:
+                return None
+            if name:
+                return name
+            print("이름을 비워둘 수 없습니다. 다시 입력하세요.", flush=True)
+        return None
+
+    def _clear_registration_pending(self, track_id: int) -> None:
+        """등록 질문이 끝난 Track의 화면 대기 상태를 해제한다."""
+        with self._snapshot_lock:
+            self._registration_pending_tracks.discard(track_id)
 
     def _apply_identity(self, track_id: int, status: str, person_name: str | None) -> None:
         """식별 완료된 이름만 화면용 투영 값으로 반영한다."""
@@ -452,6 +556,7 @@ class VisionApplication:
             with self._snapshot_lock:
                 self._lost_tracks.pop(track_id, None)
                 self._last_face_attempt_at.pop(track_id, None)
+                self._registration_pending_tracks.discard(track_id)
                 self._registered_names.pop(track_id, None)
             self._samples.clear(track_id)
             print(f"event=TRACK_ENDED track_id={track_id} at={now.isoformat()}", flush=True)
@@ -480,7 +585,7 @@ class VisionApplication:
         for person, sample_count in people:
             left, top, right, bottom = person.bbox
             cv2.rectangle(frame, (left, top), (right, bottom), (0, 200, 0), 2)
-            cv2.putText(
+            _draw_display_label(
                 frame,
                 (
                     f"{registered_names[person.internal_id]} | samples {sample_count}"
@@ -488,10 +593,8 @@ class VisionApplication:
                     else self._person_overlay_label(person.internal_id, sample_count)
                 ),
                 (left, max(24, top - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
                 (0, 200, 0),
-                2,
+                font_scale=0.6,
             )
             overlay = faces.get(person.internal_id)
             if overlay is not None:
@@ -501,6 +604,9 @@ class VisionApplication:
         """도메인 세션의 현재 신원 결과를 화면용 짧은 문구로 바꾼다."""
         with self._snapshot_lock:
             storage_track_id = self._storage_track_ids.get(track_id)
+            registration_pending = track_id in self._registration_pending_tracks
+        if registration_pending:
+            return f"등록대기 | samples {sample_count}"
         if storage_track_id is not None:
             try:
                 if self._observation_service.current_status(storage_track_id) is CurrentIdentityStatus.EXTERNAL:
@@ -515,14 +621,12 @@ class VisionApplication:
         left, top, right, bottom = overlay.bbox
         color = (0, 200, 0) if overlay.accepted else (0, 0, 220)
         cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-        cv2.putText(
+        _draw_display_label(
             frame,
             overlay.label,
             (left, min(frame.shape[0] - 8, bottom + 20)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
             color,
-            2,
+            font_scale=0.5,
         )
 
 
