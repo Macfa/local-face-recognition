@@ -19,10 +19,14 @@ from .types import FaceCandidate, FaceQuality, MemoryFaceSample, TrackedPerson
 class FaceAnalyzer:
     """확정된 사람 영역에서 가장 큰 얼굴과 랜드마크를 찾는다."""
 
-    def __init__(self) -> None:
+    def __init__(self, model_root: Path) -> None:
         """로컬 InsightFace 얼굴 검출 모델을 CPU 실행으로 준비한다."""
+        model_directory = model_root / "models" / "buffalo_l"
+        if not model_directory.is_dir():
+            raise FileNotFoundError(f"InsightFace model directory is missing: {model_directory}")
         self._analysis = FaceAnalysis(
             name="buffalo_l",
+            root=str(model_root),
             allowed_modules=["detection", "landmark_3d_68"],
             providers=["CPUExecutionProvider"],
         )
@@ -94,9 +98,9 @@ class FaceAnalyzer:
 class FaceEmbeddingComponent:
     """품질을 통과한 얼굴 후보를 로컬 ArcFace 임베딩으로 변환한다."""
 
-    def __init__(self) -> None:
+    def __init__(self, model_root: Path) -> None:
         """자동 다운로드 없이 배치된 recognition ONNX 가중치를 연다."""
-        model_path = Path.home() / ".insightface/models/buffalo_l/w600k_r50.onnx"
+        model_path = model_root / "models" / "buffalo_l" / "w600k_r50.onnx"
         if not model_path.is_file():
             raise FileNotFoundError(f"Face recognition model is missing: {model_path}")
         self._model = get_model(str(model_path), providers=["CPUExecutionProvider"])

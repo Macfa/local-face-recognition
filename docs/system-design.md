@@ -16,7 +16,7 @@
 
 ## 도메인 책임 경계
 
-`camera_streamer/domain/`은 업무 상태 전이와 불변 규칙만 소유한다.
+`local_face_recognition/domain/`은 업무 상태 전이와 불변 규칙만 소유한다.
 `PersonTrack`은 추적 생명주기, `ObservationSession`은 현재 신원과 세션 종료,
 `FaceSample`과 `IdentityDecision`은 불변 이력 생성, `IdentityPolicy`는 누적 판단,
 `RegistrationProposal`은 응답·만료 전이를 맡는다. Application Service는 도메인 객체의

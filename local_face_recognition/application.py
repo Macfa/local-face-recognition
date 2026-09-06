@@ -82,19 +82,21 @@ class VisionApplication:
 
     def __init__(self) -> None:
         """로컬 모델 컴포넌트와 최신 프레임 분석 작업자를 준비한다."""
-        root = Path(__file__).resolve().parent.parent
+        root = _resource_root()
         self._detector = PersonDetector(root / "models" / "yolo11n.pt")
         self._tracker = IoUPersonTracker()
-        self._face_analyzer = FaceAnalyzer()
-        self._face_embedding = FaceEmbeddingComponent()
+        insightface_model_root = _insightface_model_root(root)
+        self._face_analyzer = FaceAnalyzer(insightface_model_root)
+        self._face_embedding = FaceEmbeddingComponent(insightface_model_root)
         self._quality_evaluator = FaceQualityEvaluator(
             occlusion_evaluator=FaceOcclusionEvaluator(root / "models" / "face_occlusion.onnx"),
             enforce_pose_limits=True,
         )
         self._samples = InMemoryFaceSampleStore()
+        data_root = _application_data_root()
         self._repository = LocalSQLiteRepository(
-            root / "data" / "camera_streamer.sqlite3",
-            root / "data" / "face-crops",
+            data_root / "local_face_recognition.sqlite3",
+            data_root / "face-crops",
         )
         self._repository.initialize()
         self._observation_service = ObservationService(self._repository, IdentityPolicy())
@@ -115,7 +117,6 @@ class VisionApplication:
         self._registered_names: Dict[int, str] = {}
         self._lost_tracks: Dict[int, _LostTrack] = {}
         self._pending_storage_by_track: Dict[int, int] = {}
-
     def run(self) -> None:
         """카메라 표시 루프와 별도 분석 작업자를 시작하고 종료를 정리한다."""
         camera = cv2.VideoCapture(0)
@@ -523,3 +524,30 @@ class VisionApplication:
             color,
             2,
         )
+
+
+def _resource_root() -> Path:
+    """소스 실행과 PyInstaller 실행에서 공통으로 번들 리소스 위치를 찾는다."""
+    import sys
+
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+
+
+def _insightface_model_root(resource_root: Path) -> Path:
+    """번들 모델을 우선 사용하고 소스 개발 환경의 기존 모델 경로를 보조로 사용한다."""
+    bundled_root = resource_root / "models" / "insightface"
+    if (bundled_root / "models" / "buffalo_l").is_dir():
+        return bundled_root
+    return Path.home() / ".insightface"
+
+
+def _application_data_root() -> Path:
+    """OS별 사용자 전용 경로에 SQLite와 private 얼굴 crop을 저장한다."""
+    import os
+    import sys
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "local_face_recognition"
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "local_face_recognition"
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "local_face_recognition"
