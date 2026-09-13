@@ -9,17 +9,36 @@ from .ports import RegistrationRepository
 
 @dataclass(frozen=True)
 class RegistrationOutcome:
+    """등록 제안 응답 유스케이스의 결과 DTO.
+
+    Attributes:
+        status: str. REGISTERED, REJECTED, FAILED 중 처리 결과.
+        name: str | None. 성공 등록된 프로필 이름.
+        error: str | None. 실패 원인.
+    """
     status: str
     name: str | None = None
     error: str | None = None
 
 class RegistrationService:
-    """Terminal이 전달한 이름 또는 취소만 등록 저장소에 적용한다."""
+    """채널과 무관하게 RegistrationProposal의 승인·거절·만료와 프로필 생성을 수행한다."""
     def __init__(self, repository: RegistrationRepository) -> None:
+        """등록 제안과 프로필을 저장할 포트를 설정한다.
+
+        Args: repository: RegistrationRepository. 등록 영속 포트.
+        Returns: None.
+        """
         self._repository = repository
 
     def respond(self, proposal_id: str, name: str, at: datetime) -> RegistrationOutcome:
-        """Terminal 응답을 도메인 제안 전이와 프로필 등록으로 처리한다."""
+        """proposal_id에 연결된 이름 또는 거절을 도메인 전이와 프로필 등록으로 처리한다.
+
+        Args:
+            proposal_id: str. RegistrationProposal UUID 문자열.
+            name: str. 등록 이름, 빈 문자열이면 거절.
+            at: datetime. 채널 응답 시각.
+        Returns: RegistrationOutcome. 등록·거절·실패 결과.
+        """
         proposal = None
         try:
             proposal = self._repository.load_registration_proposal(UUID(proposal_id))
@@ -40,11 +59,19 @@ class RegistrationService:
                 self._repository.record_registration_failure(proposal, str(error))
             return RegistrationOutcome("FAILED", error=str(error))
 
-    def expire_pending(self, now: datetime) -> int:
-        """응답 기한이 지난 제안에 도메인 만료 전이를 적용한다."""
-        expired_count = 0
+    def expire_pending(self, now: datetime) -> list[str]:
+        """응답 기한이 지난 제안을 만료하고 조율기에서 제거할 ID를 반환한다.
+
+        Args:
+            now: datetime. 만료 여부를 판단할 UTC 시각.
+        Returns:
+            list[str]: EXPIRED로 저장된 RegistrationProposal UUID 문자열 목록.
+        Raises:
+            RuntimeError: 저장소의 만료 제안 조회 또는 상태 저장이 실패했을 때.
+        """
+        expired_proposal_ids = []
         for proposal in self._repository.load_expirable_registration_proposals(now):
             proposal.expire(now)
             self._repository.save_registration_expiration(proposal)
-            expired_count += 1
-        return expired_count
+            expired_proposal_ids.append(str(proposal.id))
+        return expired_proposal_ids
