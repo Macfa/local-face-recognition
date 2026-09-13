@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -85,10 +86,17 @@ class _TrackRecord:
     consecutive_hits: int = 1
     confirmed: bool = False
     missing: bool = False
+    previous_bbox: BBox | None = None
+    association_uncertain: bool = False
 
 
 class IoUPersonTracker:
-    """사람 상자 IoU로 다중 대상을 연결하고 확정·상실 이벤트를 만드는 컴포넌트."""
+    """위치·이동 연속성으로 사람 상자를 전역 배정하고 기술 Track 이벤트를 만든다.
+
+    내부 Track ID는 영상 상자를 잇는 기술 상태일 뿐 사람 신원을 뜻하지 않는다. 연결 후보가
+    가까워 확신할 수 없으면 TRACK_ASSOCIATION_UNCERTAIN을 발행해 Application이 이름을
+    숨기고 새 얼굴 검증을 시작할 수 있게 한다.
+    """
 
     def __init__(
         self,
@@ -96,6 +104,7 @@ class IoUPersonTracker:
         missing_after_seconds: float = 1.0,
         retain_after_missing_seconds: float = 30.0,
         iou_threshold: float = 0.3,
+        association_margin: float = 0.08,
     ) -> None:
         """추적 확인·상실·상자 연결 정책을 초기화한다.
 
@@ -104,6 +113,7 @@ class IoUPersonTracker:
             missing_after_seconds: float. 마지막 검출 후 화면에서 잠시 사라졌다고 판단할 시간.
             retain_after_missing_seconds: float. MISSING 후 동일 기술 Track을 보관할 시간.
             iou_threshold: float. 기존 Track 연결에 필요한 최소 IoU.
+            association_margin: float. 최상위·차선 연결 점수 차이의 불확실 경계.
         Returns:
             None.
         """
@@ -111,6 +121,7 @@ class IoUPersonTracker:
         self._missing_after_seconds = missing_after_seconds
         self._retain_after_missing_seconds = retain_after_missing_seconds
         self._iou_threshold = iou_threshold
+        self._association_margin = association_margin
         self._next_id = 1
         self._records: Dict[int, _TrackRecord] = {}
 
@@ -131,17 +142,37 @@ class IoUPersonTracker:
         matched_track_ids: set[int] = set()
         events: List[TrackEvent] = []
 
-        for track_id, record in list(self._records.items()):
-            detection_index = self._find_best_match(record, detections, remaining_detection_indexes)
-            if detection_index is None:
-                continue
+        assignments = self._globally_assign(detections)
+        uncertain_track_ids = {
+            track_id
+            for track_id, detection_index in assignments.items()
+            if self._is_ambiguous_assignment(self._records[track_id], detections, detection_index)
+        }
+        for first_track_id, first_detection_index in assignments.items():
+            for second_track_id, second_detection_index in assignments.items():
+                if first_track_id >= second_track_id:
+                    continue
+                first_record, second_record = self._records[first_track_id], self._records[second_track_id]
+                if first_record.confirmed and second_record.confirmed and intersection_over_union(
+                    detections[first_detection_index].bbox,
+                    detections[second_detection_index].bbox,
+                ) >= 0.5:
+                    uncertain_track_ids.update({first_track_id, second_track_id})
+        for track_id, detection_index in assignments.items():
+            record = self._records[track_id]
+            uncertain = track_id in uncertain_track_ids
+            was_missing = record.missing
+            record.previous_bbox = record.bbox
             record.bbox = detections[detection_index].bbox
             record.consecutive_hits += 1
             record.last_seen_at = occurred_at
-            if record.missing:
+            if was_missing:
                 record.missing = False
                 if record.confirmed:
                     events.append(TrackEvent("TRACK_REAPPEARED", track_id, occurred_at))
+            if record.confirmed and uncertain and not record.association_uncertain and not was_missing:
+                events.append(TrackEvent("TRACK_ASSOCIATION_UNCERTAIN", track_id, occurred_at))
+            record.association_uncertain = uncertain
             matched_track_ids.add(track_id)
             remaining_detection_indexes.remove(detection_index)
 
@@ -174,26 +205,92 @@ class IoUPersonTracker:
         ]
         return active_people, events
 
-    def _find_best_match(
+    def _globally_assign(self, detections: Sequence[PersonDetection]) -> Dict[int, int]:
+        """기존 Track과 검출 상자의 총 연결 점수가 가장 큰 일대일 배정을 계산한다.
+
+        Returns:
+            Dict[int, int]. 내부 Track ID와 연결된 detection 인덱스의 매핑.
+        """
+        track_ids = tuple(self._records.keys())
+        if not track_ids or not detections:
+            return {}
+        score_rows = tuple(
+            tuple(self._association_score(self._records[track_id], detection.bbox) for detection in detections)
+            for track_id in track_ids
+        )
+
+        @lru_cache(maxsize=None)
+        def choose(track_index: int, used_mask: int) -> Tuple[float, Tuple[int | None, ...]]:
+            if track_index == len(track_ids):
+                return 0.0, ()
+            best_score, tail = choose(track_index + 1, used_mask)
+            best_assignment: Tuple[int | None, ...] = (None,) + tail
+            for detection_index, score in enumerate(score_rows[track_index]):
+                if score is None or used_mask & (1 << detection_index):
+                    continue
+                next_score, next_tail = choose(track_index + 1, used_mask | (1 << detection_index))
+                total = score + next_score
+                if total > best_score:
+                    best_score = total
+                    best_assignment = (detection_index,) + next_tail
+            return best_score, best_assignment
+
+        _, selected = choose(0, 0)
+        return {
+            track_id: detection_index
+            for track_id, detection_index in zip(track_ids, selected)
+            if detection_index is not None
+        }
+
+    def _association_score(self, record: _TrackRecord, detection_bbox: BBox) -> float | None:
+        """IoU와 이전 이동 방향을 함께 반영한 Track-검출 연결 점수를 계산한다."""
+        overlap = intersection_over_union(record.bbox, detection_bbox)
+        if overlap < self._iou_threshold:
+            return None
+        predicted = _predicted_bbox(record)
+        motion_distance = _normalized_center_distance(predicted, detection_bbox)
+        motion_score = max(0.0, 1.0 - motion_distance)
+        return overlap * 0.75 + motion_score * 0.25
+
+    def _is_ambiguous_assignment(
         self,
         record: _TrackRecord,
         detections: Sequence[PersonDetection],
-        remaining_detection_indexes: set[int],
-    ) -> int | None:
-        """아직 배정되지 않은 검출 중 Track과 IoU가 가장 큰 인덱스를 찾는다.
+        selected_index: int,
+    ) -> bool:
+        """선택된 상자가 차선 후보와 구분되지 않는지 확인한다."""
+        scores = sorted(
+            (score for detection in detections if (score := self._association_score(record, detection.bbox)) is not None),
+            reverse=True,
+        )
+        selected_score = self._association_score(record, detections[selected_index].bbox)
+        if selected_score is None or len(scores) < 2:
+            return False
+        return scores[0] - scores[1] < self._association_margin
 
-        Args:
-            record: _TrackRecord. 연결 기준이 되는 기존 Track 상태.
-            detections: Sequence[PersonDetection]. 현재 프레임 검출 목록.
-            remaining_detection_indexes: set[int]. 다른 Track에 아직 배정되지 않은 인덱스.
-        Returns:
-            int | None. 최소 IoU를 통과한 최적 검출 인덱스 또는 None.
-        """
-        best_index: int | None = None
-        best_iou = self._iou_threshold
-        for candidate_index in remaining_detection_indexes:
-            overlap = intersection_over_union(record.bbox, detections[candidate_index].bbox)
-            if overlap >= best_iou:
-                best_index = candidate_index
-                best_iou = overlap
-        return best_index
+
+def _predicted_bbox(record: _TrackRecord) -> BBox:
+    """직전 상자 이동량으로 현재 프레임의 중심 위치를 짧게 예측한다."""
+    if record.previous_bbox is None:
+        return record.bbox
+    last_center = _bbox_center(record.bbox)
+    previous_center = _bbox_center(record.previous_bbox)
+    delta_x, delta_y = last_center[0] - previous_center[0], last_center[1] - previous_center[1]
+    return tuple(
+        int(value + offset)
+        for value, offset in zip(record.bbox, (delta_x, delta_y, delta_x, delta_y))
+    )  # type: ignore[return-value]
+
+
+def _normalized_center_distance(first: BBox, second: BBox) -> float:
+    """두 상자 중심 거리를 평균 상자 대각선으로 정규화한다."""
+    first_center, second_center = _bbox_center(first), _bbox_center(second)
+    distance = ((first_center[0] - second_center[0]) ** 2 + (first_center[1] - second_center[1]) ** 2) ** 0.5
+    first_diagonal = ((first[2] - first[0]) ** 2 + (first[3] - first[1]) ** 2) ** 0.5
+    second_diagonal = ((second[2] - second[0]) ** 2 + (second[3] - second[1]) ** 2) ** 0.5
+    return distance / max(1.0, (first_diagonal + second_diagonal) / 2.0)
+
+
+def _bbox_center(bbox: BBox) -> Tuple[float, float]:
+    """사람 상자의 중심 좌표를 반환한다."""
+    return (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0

@@ -64,6 +64,34 @@ Application은 신원 판단 규칙이나 AI 알고리즘을 직접 갖지 않�
 이름은 `이름?`로만 표시하고 새 ObservationSession에서 얼굴 표본을 재검증한다. 30초를 넘기면
 `TRACK_LOST`로 내부 ID를 폐기한다. Domain에는 관찰 시작·상실 이벤트만 전달하고 내부 ID·bounding box·프레임 카운터는 저장하지 않는다.
 
+### 기술 Track과 신원 표시
+
+추적 컴포넌트의 내부 Track ID는 화면에서 사람 상자를 이어 주는 **기술 상태**다. 이 값은
+등록 인물이나 화면 이름의 근거가 아니다. 특히 다수 사람이 가까워지거나 교차·가림으로
+상자가 겹치면, 같은 내부 ID가 다른 사람 상자에 연결될 수 있다.
+
+따라서 Application은 내부 Track ID와 별도로 `TrackIdentityProjection`을 관리한다. 이는
+영속 Domain 엔티티가 아니라 화면 투영 상태이며, `technical_track_id`,
+`observation_session_key`, `display_state`, 화면용 이름 또는 재검증 힌트를 함께 가진다.
+프로필과 판단 근거는 해당 키가 가리키는 `ObservationSession.current_identity`에서 조회한다.
+`display_state`는 `VERIFYING`, `VERIFIED`, `UNREGISTERED` 중 하나다.
+
+- `VERIFIED`이면서 현재 활성 `ObservationSession`의 `IDENTIFIED` 결과와 세션 ID가 모두
+  일치할 때만 등록 이름을 확정 표시한다.
+- `VERIFYING`에서는 과거 이름을 확정 이름으로 표시하지 않는다. 30초 안의 재등장에는
+  `이름?`, 다인 연결이 불확실한 경우에는 `표본 수집 중 | T-...`를 표시한다.
+- `UNREGISTERED`에서는 `임시 인물 | U-...`만 표시한다.
+- 비동기 얼굴 분석·저장·신원 결과는 반드시 `technical_track_id`와
+  `observation_session_key`를 함께 운반한다. 화면 투영은 결과의 세션 키가 현재 연결된
+  세션과 다르면 과거 결과로 폐기한다.
+
+다인 추적에서 내부 ID 연결은 Track을 순서대로 탐욕 배정하지 않는다. 이전 위치·이동 예측과
+IoU를 비용으로 모든 Track과 현재 검출 상자의 전역 최적 배정을 계산한다. 두 후보의 비용
+차이가 작거나, 확정 Track 상자가 겹치거나, 이동 연속성이 깨지면 `TRACK_ASSOCIATION_UNCERTAIN`
+이벤트를 낸다. 이 이벤트는 이름을 즉시 `VERIFYING`으로 내리고 새 ObservationSession의 얼굴
+검증을 시작하게 하지만, 그 자체로 다른 사람의 이름을 확정하지는 않는다. 사람 추적기는
+신원 판단을 수행하지 않으며 얼굴 임베딩 검증만이 이름 표시의 최종 근거다.
+
 ## 실시간 실행 구조
 
 카메라 프레임은 즉시 영상 출력으로 전달된다. 같은 프레임은 제한된 큐를 통해

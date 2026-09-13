@@ -14,8 +14,9 @@
 | `PersonProfileFaceTemplate` | 등록 인물의 얼굴 임베딩 표본 |
 | `RegistrationProposal` | 임시 인물로 전환된 관찰에 대한 등록 응답과 만료를 관리 |
 
-`PersonTrack`은 카메라 속 대상이고 `PersonProfile`은 등록 인물이다. 둘은
-같은 개념이 아니며, 추적이 시작될 때 그 대상의 신원은 알 수 없다.
+`PersonTrack`은 카메라 속 대상의 관찰 생명주기이고 `PersonProfile`은 등록 인물이다. 둘은
+같은 개념이 아니며, 추적이 시작될 때 그 대상의 신원은 알 수 없다. 추적 컴포넌트의 내부
+Track ID와 bounding box는 Domain 객체가 아니며, 화면 이름을 직접 결정할 수 없다.
 
 ## 도메인 관계와 불변 규칙
 
@@ -93,6 +94,11 @@ stateDiagram-v2
 화면에 다시 나타난 사람은 새 `PersonTrack`으로 시작한다. 과거 `PersonTrack`을
 복구하거나 장기 재식별하지 않는다. 새 추적도 같은 얼굴 분석과 등록 인물 검색을
 독립적으로 수행한다.
+
+컴포넌트 내부 ID는 마지막 검출 뒤 30초 동안 보존할 수 있다. 이 기술적 보존은 Domain
+PersonTrack 복구나 과거 이름의 재사용을 뜻하지 않는다. 재등장 또는 다인 추적 연결 불확실성은
+새 관찰과 새 신원 검증을 시작하는 사유이며, 이름 확정은 새 ObservationSession의
+`IdentityDecision` 누적 결과로만 다시 가능하다.
 
 ## 신원 판단
 

@@ -5,7 +5,7 @@
 ```mermaid
 flowchart TD
     F[Frame] --> D[Person Detection]
-    D --> T[Person Tracking: 내부 ID 연속 확인]
+    D --> T[Person Tracking: 위치·이동 기반 내부 ID 연결]
     T --> P[TRACK_CONFIRMED]
     P --> PT[PersonTrack 생성 또는 갱신]
     PT --> S[ObservationSession 생성 또는 유지]
@@ -30,7 +30,8 @@ flowchart TD
 | 입력 상태 | Application 처리 | 관찰 세션 |
 | --- | --- | --- |
 | 새 `TRACK_CONFIRMED` | `PersonTrack` 생성 | 새 `ObservationSession` 생성 |
-| 이미 연결된 내부 ID의 확인 결과 | 기존 Track 갱신 | 기존 세션 유지 |
+| 안정적으로 연결된 내부 ID의 확인 결과 | 기존 기술 Track 갱신 | 기존 세션 유지 |
+| `TRACK_ASSOCIATION_UNCERTAIN` | 확정 이름 제거, `VERIFYING` 화면 상태로 전환 | 새 관찰 시작 후 얼굴 표본 재검증 |
 | `TRACK_MISSING` | 화면 표시 제거, 30초 기술 Track 보존 및 기존 관찰 세션 LOST 기록 | 유지 |
 | `TRACK_REAPPEARED` | 같은 기술 Track에 새 ObservationSession을 만들고 재검증 시작 | 새 세션 생성 |
 | `TRACK_LOST` | 30초 내 재등장하지 않은 기술 Track 폐기 | 이미 LOST인 세션 이력 유지 |
@@ -38,7 +39,10 @@ flowchart TD
 화면에서 확정 Track은 `표본 수집 중 | T-XXXXXXXX`으로 표시한다. `T-` 코드는 현재 관찰
 세션을 구별하는 임시 코드다. 최대 표본까지 등록 인물로 확인되지 않으면 `임시 인물 | U-XXXXXXXX`으로 바뀐다. `U-`
 코드는 `RegistrationProposal` ID에서 만든 불변 임시 인물 코드이며, 화면과 터미널의 이름
-입력 요청은 같은 코드를 사용한다. 등록 인물은 기본적으로 이름만 표시한다.
+입력 요청은 같은 코드를 사용한다. 등록 이름은 현재 기술 Track의 활성 ObservationSession이
+`IDENTIFIED`이고 그 결과를 만든 관찰 세션 키가 화면 투영의 키와 같을 때만 표시한다. 단,
+현재 관찰 세션의 `RegistrationProposal`을 사용자가 승인해 프로필 생성이 성공한 경우에도 같은
+관찰 세션 키에 한해 입력한 이름을 즉시 표시할 수 있다.
 
 `RegistrationCoordinator`는 임시 인물 전환 완료 순서(FIFO)로 요청을 관리하고, 등록 채널에는
 한 번에 하나의 활성 요청만 전달한다. 현재 요청의 Y/N과 이름 입력이 완료돼야 다음 요청을
@@ -51,6 +55,16 @@ flowchart TD
 화면 표시만 지우고 내부 ID를 30초 보관한다. 그 안에 IoU로 다시 연결되면 `TRACK_REAPPEARED`를
 내며, 이전 이름은 `이름?`으로만 표시한다. 재등장자는 같은 기술 Track을 쓰되 새
 ObservationSession에서 얼굴 표본을 다시 검증한다. 검증 전 이름은 확정 표시하지 않는다.
+
+두 명 이상이 보일 때는 단순히 상자가 가장 많이 겹친다는 이유만으로 신원 표시를 유지하지
+않는다. 위치·이동 기반 전역 배정의 후보가 애매하면 `TRACK_ASSOCIATION_UNCERTAIN`으로 처리한다.
+이때 기존 이름을 즉시 제거하고 새 ObservationSession을 시작한다. 한 표본의 불일치는 기존
+이름을 숨기는 근거일 뿐 다른 이름을 확정하는 근거가 아니며, 새 이름은 기존 `IdentityPolicy`의
+비중복 FaceSample 2개 규칙을 다시 통과해야 한다.
+
+분석·저장 작업은 비동기로 끝날 수 있다. 그러므로 FaceSample, IdentityDecision, 화면 갱신
+요청에는 생성 당시의 관찰 세션 키를 포함한다. 기술 Track이 재사용·재검증된 뒤
+늦게 도착한 과거 세션 결과는 현재 화면 상태를 변경할 수 없다.
 
 ## 신원 상태 흐름
 
