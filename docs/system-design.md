@@ -59,11 +59,10 @@ Application은 신원 판단 규칙이나 AI 알고리즘을 직접 갖지 않�
 기술에 직접 의존하지 않는다.
 
 사람 추적기는 검출 결과를 내부 ID로 연결한다. 같은 내부 ID가 연속 확인 프레임 수를
-채우면 `TRACK_CONFIRMED`, 마지막 검출 뒤 상실 허용 시간(초)을 넘기면 내부 ID를 폐기하고
-`TRACK_LOST`를 Application에 전달한다. 초기 확인 프레임 수는 3, 상실 허용 시간은 1초이며,
-두 기준은 런타임 설정값이다. `TRACK_LOST` 이후 재등장한 사람은 기존 내부 ID를 복구하지 않고
-새 내부 ID·새 PersonTrack·새 ObservationSession으로 시작한다. Domain에는 이 확정·상실 이벤트만 전달하고 내부 ID·bounding box·프레임 카운터는 저장하지
-않는다.
+채우면 `TRACK_CONFIRMED`를 낸다. 마지막 검출 뒤 1초에는 `TRACK_MISSING`으로 화면 표시만
+제거하고 내부 ID를 30초 보관한다. 그 안에 다시 연결되면 `TRACK_REAPPEARED`를 내며, 이전
+이름은 `이름?`로만 표시하고 새 ObservationSession에서 얼굴 표본을 재검증한다. 30초를 넘기면
+`TRACK_LOST`로 내부 ID를 폐기한다. Domain에는 관찰 시작·상실 이벤트만 전달하고 내부 ID·bounding box·프레임 카운터는 저장하지 않는다.
 
 ## 실시간 실행 구조
 
@@ -167,7 +166,7 @@ erDiagram
 | `status` | enum | `ACTIVE`, `ENDED` |
 | `started_at` | UTC datetime | 관찰 시작 시각 |
 | `ended_at` | UTC datetime, nullable | 관찰 종료 시각 |
-| `current_identity_status` | enum | `ANALYZING`, `IDENTIFIED`, `EXTERNAL` |
+| `current_identity_status` | enum | `ANALYZING`, `IDENTIFIED`, `UNREGISTERED` |
 | `current_person_profile_id` | UUID, FK, nullable | `IDENTIFIED`인 현재 프로필 |
 | `current_identity_decision_id` | UUID, FK, nullable | 현재 결과의 근거 IdentityDecision |
 | `current_identity_evaluated_at` | UTC datetime | 현재 결과를 계산한 시각 |
@@ -276,12 +275,12 @@ Terminal에 한 번 제시되는 등록 질문의 단기 상태다.
 - 하나의 ObservationSession에는 등록 제안이 최대 하나다. N·만료 뒤에도 같은
   세션에 새 제안을 만들지 않는다.
 - `IDENTIFIED` 현재 결과에는 Profile ID와 근거 IdentityDecision ID가 필수다.
-- `ANALYZING`과 `EXTERNAL` 현재 결과에는 Profile ID가 없다.
+- `ANALYZING`과 `UNREGISTERED` 현재 결과에는 Profile ID가 없다.
 - `IDENTIFIED`는 같은 PersonProfile의 등록 인물 근거가 서로 다른 FaceSample에서 2개 이상
-  확인된 결과다. `EXTERNAL`은 등록 인물 근거가 없는 FaceSample 3개 이상으로 확정한다.
-- `IDENTIFIED` 또는 `EXTERNAL`이 되면 해당 ObservationSession의 FaceSample 수집을
+  확인된 결과다. `UNREGISTERED`는 등록 인물 근거가 없는 FaceSample 5개로 확정한다.
+- `IDENTIFIED` 또는 `UNREGISTERED`가 되면 해당 ObservationSession의 FaceSample 수집을
   중단한다.
-- `EXTERNAL` 세션의 등록 제안은 이미 저장된 FaceSample 중 등록 표본 정책을 충족하는
+- `UNREGISTERED` 세션의 등록 제안은 이미 저장된 FaceSample 중 등록 표본 정책을 충족하는
   구성으로만 만든다. 부족한 경우 같은 세션에서 표본을 더 수집하거나 제안을 만들지 않는다.
 - PersonProfileFaceTemplate의 source FaceSample은 필수이며 다른 템플릿과 공유하지 않는다.
 - PersonProfileFaceTemplate이 참조하는 FaceSample은 물리 파기하지 않는다. 참조가 없는
@@ -341,10 +340,10 @@ DB 제약 변경 없이 독립적으로 다룰 수 있다.
 로컬 SQLite 저장소는 한 프로세스의 단일 저장 작업자가 쓴다. 분석 작업자는 저장 완료를
 기다리지 않으며, 로컬 운영에서도 영상 표시와 분석 작업을 막지 않는다. SQLite에는 pgvector
 인덱스를 흉내 내는 확장을 추가하지 않는다. 현재 로컬 운영은 `IDENTIFIED` 또는
-`EXTERNAL`이 확정될 때까지 FaceSample 수를 전역 제한하지 않는다. 같은 방향의 짧은 주기
-반복과 거의 동일한 임베딩만 중복으로 막는다. 등록 인물 근거가 없는 세 표본으로
-`EXTERNAL`이 확정되면 별도 Terminal 작업자에게 이름 입력을 요청한다. 외부인 판단에
-사용된 세 FaceSample을 새 프로필 템플릿으로 등록하며, Terminal에서 `Y/N` 확인 뒤 이름을
+`UNREGISTERED`가 확정될 때까지 FaceSample은 최대 다섯 개다. 같은 방향의 짧은 주기
+반복과 거의 동일한 임베딩만 중복으로 막는다. 등록 인물 근거가 없는 다섯 표본으로
+`UNREGISTERED`가 확정되면 별도 Terminal 작업자에게 이름 입력을 요청한다. 임시 인물 판단에
+사용된 FaceSample을 새 프로필 템플릿으로 등록하며, Terminal에서 `Y/N` 확인 뒤 이름을
 입력한다. 이름 입력은 카메라·분석·SQLite
 저장 작업을 멈추지 않는다.
 SQLite의 `registration_proposals`와 `registration_handlings`는 Terminal 등록의

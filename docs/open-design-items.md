@@ -7,7 +7,7 @@
 
 다음 기본 흐름은 확정했다.
 
-1. `EXTERNAL`로 확정되기 전에는 등록을 묻지 않는다. 확정 때까지 이미 저장된 표본이
+1. `UNREGISTERED`로 확정되기 전에는 등록을 묻지 않는다. 확정 때까지 이미 저장된 표본이
    등록 정책의 고품질·자세 다양성 조건을 충족할 때만 등록을 묻는다. 조건이 부족하면
    해당 ObservationSession에는 등록을 묻지 않는다.
 2. 조건을 충족하면 ObservationSession당 한 번 `RegistrationProposal`을 만든다.
@@ -71,14 +71,14 @@ ObservationSession에 다시 묻지 않는다.
   현재 인물을 정하지 않는다.
 - `ObservationSession.current_identity`가 현재 결과, PersonProfile 참조, 근거
   IdentityDecision 참조를 보관한다.
-- 현재 결과는 `ANALYZING`, `IDENTIFIED`, `EXTERNAL`이다.
+- 현재 결과은 `ANALYZING`, `IDENTIFIED`, `UNREGISTERED`이다.
 - 최상위 검색 결과는 이력으로 보존하되, 유사도가 등록 인물 인정 임계값 이상일 때만
   해당 PersonProfile의 근거로 계산한다.
 - 같은 PersonProfile의 근거가 비중복 FaceSample 2개 이상이면 `IDENTIFIED`, 등록 인물
-  근거가 없는 비중복 FaceSample 3개 이상이면 `EXTERNAL`이다.
+  근거가 없는 비중복 FaceSample 5개 이상이면 `UNREGISTERED`이다.
 - 검색 결과 동점은 유사도 내림차순 뒤 템플릿 ID 오름차순으로 고정 정렬한다. 동점 자체가
   별도 신원 상태를 만들지는 않는다.
-- `IDENTIFIED` 또는 `EXTERNAL`이 결정되면 해당 세션의 FaceSample 수집을 중단한다.
+- `IDENTIFIED` 또는 `UNREGISTERED`가 결정되면 해당 세션의 FaceSample 수집을 중단한다.
 
 아직 확정할 내용:
 

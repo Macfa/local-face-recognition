@@ -12,7 +12,7 @@
 | `ObservationSession.current_identity` | 현재 관찰 대상의 최신 정체성 결과를 빠르게 조회하기 위한 속성 |
 | `PersonProfile` | 시스템이 알고 있는 등록 인물 |
 | `PersonProfileFaceTemplate` | 등록 인물의 얼굴 임베딩 표본 |
-| `RegistrationProposal` | 외부인으로 확정된 관찰에 대한 등록 응답과 만료를 관리 |
+| `RegistrationProposal` | 임시 인물로 전환된 관찰에 대한 등록 응답과 만료를 관리 |
 
 `PersonTrack`은 카메라 속 대상이고 `PersonProfile`은 등록 인물이다. 둘은
 같은 개념이 아니며, 추적이 시작될 때 그 대상의 신원은 알 수 없다.
@@ -40,7 +40,7 @@ flowchart LR
   두 기준을 통과한 후보만 FaceSample으로 생성·영속 저장하고 신원 판단으로 보낸다.
   FaceSample은 하나의 `FaceSampleEmbedding`과 최대 하나의 `IdentityDecision`을 가진다.
 - 현재 정체성이 `ANALYZING`일 때만 새 FaceSample을 생성한다. `IDENTIFIED` 또는
-  `EXTERNAL`로 결론이 나면 해당 ObservationSession에서는 이후 FaceCandidate를
+  `UNREGISTERED`로 결론이 나면 해당 ObservationSession에서는 이후 FaceCandidate를
   FaceSample로 저장하거나 IdentityDecision으로 판단하지 않는다.
 - `IdentityDecision`은 그 표본의 최상위 검색 결과를 참조한다. 활성 템플릿이 없어
   검색 후보 자체가 없을 때만 PersonProfile과 템플릿 참조는 비어 있을 수 있다. 생성된
@@ -68,7 +68,7 @@ flowchart LR
 | `FaceSampleEmbedding` | FaceSample과 함께 영속 저장 | 모델 버전과 함께 저장, 재분석·등록 템플릿의 원본 |
 | `ObservationSession` | 영속 저장 | FaceSample과 IdentityDecision의 관찰 맥락 보존 |
 | `IdentityDecision` | 영속 저장 | 어떤 표본이 어떤 판단에 이르렀는지 이력 보존 |
-| `RegistrationProposal` | 단기 영속 저장 | 응답·만료 후 상태 보존 범위는 추후 결정, 응답 가능 기간 최대 30분 |
+| `RegistrationProposal` | 단기 영속 저장 | 응답 가능 기간 1시간, 만료 뒤 임시 인물 정보는 완전 삭제 대상 |
 | `PersonProfile` | 영속 저장 | 삭제 요청 전까지 보존 |
 | `PersonProfileFaceTemplate` | 영속 저장·벡터 검색 대상 | 저장된 FaceSampleEmbedding을 등록 템플릿으로 연결 |
 
@@ -114,12 +114,12 @@ stateDiagram-v2
 
 현재 정체성 결과는 다음 셋 중 하나다.
 
-- `ANALYZING`: 아직 지인 또는 외부인 결론을 내릴 충분한 표본이 없음
+- `ANALYZING`: 아직 등록 인물 확인 또는 임시 코드 전환을 위한 충분한 표본이 없음
 - `IDENTIFIED`: 같은 PersonProfile의 등록 인물 근거가 비중복 FaceSample 2개 이상에서
   확인됨
-- `EXTERNAL`: 등록 인물 근거가 없는 비중복 FaceSample이 3개 이상임
+- `UNREGISTERED`: 등록 인물 근거가 없는 비중복 FaceSample이 5개 이상임
 
-`IDENTIFIED`와 `EXTERNAL`은 해당 ObservationSession의 최종 정체성 결과다. 둘 중 하나가
+`IDENTIFIED`와 `UNREGISTERED`는 해당 ObservationSession의 최종 정체성 결과다. 둘 중 하나가
 결정되면 FaceSample 수집을 중단한다. 이미 분석 큐에 있던 FaceCandidate 결과가 뒤늦게
 돌아와도 새 FaceSample이나 IdentityDecision으로 저장하지 않고 폐기한다.
 
@@ -151,7 +151,7 @@ FaceSampleEmbedding을 다시 계산하지 않고 사용하며, `source_face_sam
 FaceSampleEmbedding은 이력·재분석 용도로만 보관한다.
 
 하나의 FaceSample은 하나의 PersonProfileFaceTemplate에만 연결할 수 있다. 템플릿 추가는
-외부인 등록 승인 처리에서만 발생하며, 프로필을 선택해 수동으로 추가하는 운영 흐름은 없다.
+임시 인물 등록 승인 처리에서만 발생하며, 프로필을 선택해 수동으로 추가하는 운영 흐름은 없다.
 
 삭제 대상의 얼굴 템플릿과 프로필 정보는 삭제 처리와 함께 물리적으로 파기한다. 보유 목적이
 끝난 개인정보의 파기 범위는 실제 운영 전 법적 보존 정책과 함께 확정한다.
@@ -296,7 +296,7 @@ class IdentityDecision:
 class CurrentIdentityStatus(str, Enum):
     ANALYZING = "ANALYZING"
     IDENTIFIED = "IDENTIFIED"
-    EXTERNAL = "EXTERNAL"
+    UNREGISTERED = "UNREGISTERED"
 
 
 @dataclass(frozen=True)
@@ -547,14 +547,14 @@ class IdentityPolicy(Protocol):
 
 ## 등록 제안
 
-`EXTERNAL`은 충분한 고품질·비중복 표본을 확인했지만 현재 등록 인물로 확정되지
-않았다는 현재 결과다. 이 상태가 되기 전에는 등록을 묻지 않는다. 하나의
-`ObservationSession`에서 외부인 결과가 확정됐을 때만 등록 제안을 만들 수 있다.
+`UNREGISTERED`는 충분한 고품질·비중복 표본 다섯 개를 확인했지만 현재 등록 프로필로 확정되지
+않아 임시 코드로 보관한다는 현재 결과다. 이 상태가 되기 전에는 등록을 묻지 않는다. 하나의
+`ObservationSession`에서 임시 인물 결과가 확정됐을 때만 등록 제안을 만들 수 있다.
 
 등록 제안은 프로필이나 얼굴 템플릿이 아니다. 등록 여부를 운영자에게 묻기 위한
 일시적 업무 객체이며, 같은 ObservationSession에는 한 번만 생성한다.
 
-등록 제안은 `EXTERNAL`을 확정하는 데 사용돼 이미 저장된 FaceSample만 선택한다. 외부인
+등록 제안은 `UNREGISTERED`를 확정하는 데 사용돼 이미 저장된 FaceSample만 선택한다. 임시 인물
 확정 뒤에는 FaceSample을 더 만들지 않으므로, 선택 가능한 표본이 등록 정책의 최소 수와
 자세 다양성을 충족할 때만 제안을 생성한다. 충족하지 못하면 해당 ObservationSession에서는
 등록을 묻지 않는다.
@@ -628,7 +628,7 @@ class RegistrationResponse:
 `PENDING` 상태이고 만료 시각 이후일 때만 호출한다. 종료 상태에서는 응답을 바꾸거나 다시
 제안할 수 없다.
 
-제안 생성 전의 `EXTERNAL` 상태 확인, 같은 세션에 기존 제안이 없는지 확인, 선택된
+제안 생성 전의 `UNREGISTERED` 상태 확인, 같은 세션에 기존 제안이 없는지 확인, 선택된
 FaceSample이 해당 세션의 영속 표본인지 확인은 다른 이력을 조회해야 하므로 Application과
 Repository의 책임이다. 충분한 표본 수와 자세 다양성 기준은 등록 정책에서 결정한다.
 
@@ -640,8 +640,8 @@ Repository의 책임이다. 충분한 표본 수와 자세 다양성 기준은 �
 crop을 MinIO에 새로 저장하지 않는다. pgvector가 PostgreSQL 안에서 템플릿 검색을 제공하므로
 프로필·템플릿·등록 처리 결과는 하나의 PostgreSQL 트랜잭션으로 함께 커밋한다.
 
-등록 성공은 현재 `EXTERNAL` ObservationSession을 `IDENTIFIED`로 바꾸지 않는다.
-IdentityDecision은 FaceSample당 하나의 불변 이력이며, 외부인 확정 뒤에는 새 표본과 새
+등록 성공은 현재 `UNREGISTERED` ObservationSession을 `IDENTIFIED`로 바꾸지 않는다.
+IdentityDecision은 FaceSample당 하나의 불변 이력이며, 임시 인물 확정 뒤에는 새 표본과 새
 결정을 만들지 않기 때문이다. 새 PersonProfile과 템플릿은 이후 새 ObservationSession의
 검색 대상부터 사용한다.
 

@@ -22,7 +22,7 @@ flowchart TD
     ID --> POL[IdentityPolicy: 임계값 이상 근거를 세션별 누적 평가]
     POL --> CI[ObservationSession.current_identity 갱신]
     CI -->|ANALYZING| NEXT[다음 FaceCandidate 분석]
-    CI -->|IDENTIFIED 또는 EXTERNAL| STOP[해당 세션 FaceSample 수집 중단]
+    CI -->|IDENTIFIED 또는 UNREGISTERED| STOP[해당 세션 FaceSample 수집 중단]
 ```
 
 ## 추적 상태별 처리
@@ -31,25 +31,26 @@ flowchart TD
 | --- | --- | --- |
 | 새 `TRACK_CONFIRMED` | `PersonTrack` 생성 | 새 `ObservationSession` 생성 |
 | 이미 연결된 내부 ID의 확인 결과 | 기존 Track 갱신 | 기존 세션 유지 |
-| `TRACK_LOST` | 화면 표시 제거, 이미 시작한 분석·저장 작업 마무리 | 유지 |
+| `TRACK_MISSING` | 화면 표시 제거, 30초 기술 Track 보존 및 기존 관찰 세션 LOST 기록 | 유지 |
+| `TRACK_REAPPEARED` | 같은 기술 Track에 새 ObservationSession을 만들고 재검증 시작 | 새 세션 생성 |
+| `TRACK_LOST` | 30초 내 재등장하지 않은 기술 Track 폐기 | 이미 LOST인 세션 이력 유지 |
 
 화면에서 확정 Track은 `표본 수집 중 | T-XXXXXXXX`으로 표시한다. `T-` 코드는 현재 관찰
-세션을 구별하는 임시 코드다. 외부인 판정이 나면 `외부인 | E-XXXXXXXX`으로 바뀐다. `E-`
-코드는 `RegistrationProposal` ID에서 만든 불변 등록 요청 코드이며, 화면과 터미널의 이름
+세션을 구별하는 임시 코드다. 최대 표본까지 등록 인물로 확인되지 않으면 `임시 인물 | U-XXXXXXXX`으로 바뀐다. `U-`
+코드는 `RegistrationProposal` ID에서 만든 불변 임시 인물 코드이며, 화면과 터미널의 이름
 입력 요청은 같은 코드를 사용한다. 등록 인물은 기본적으로 이름만 표시한다.
 
-`RegistrationCoordinator`는 외부인 판정 완료 순서(FIFO)로 요청을 관리하고, 등록 채널에는
+`RegistrationCoordinator`는 임시 인물 전환 완료 순서(FIFO)로 요청을 관리하고, 등록 채널에는
 한 번에 하나의 활성 요청만 전달한다. 현재 요청의 Y/N과 이름 입력이 완료돼야 다음 요청을
 묻는다. Telegram은 같은 `RegistrationChannel` 포트를 구현하는 추가 어댑터이며, 도메인 등록
 규칙과 FIFO 순서는 바꾸지 않는다.
 | LOST 후 10분 경과 + 진행 작업 완료 | Track 종료 | 세션 종료 |
 
 추적 컴포넌트는 같은 내부 ID가 연속 확인 프레임 수를 채워야 `TRACK_CONFIRMED`를 낸다.
-초기 확인 프레임 수는 3이다. 마지막 검출 뒤 1초 동안 다시 확인되지 않으면 내부 ID를
-폐기하고 `TRACK_LOST`를 낸다. 이 시간은 분석 작업자 처리량과 무관한 실제 경과 시간 기준이다.
-`TRACK_LOST` 순간 화면의 이름·등록대기·얼굴 오버레이는 즉시 제거한다. 이후 재등장자는 기존
-내부 ID나 ObservationSession을 복구하지 않고 새 Track으로 확인 과정을 다시 시작한다.
-10분 보관은 과거 LOST Track의 DB 이력 종료를 위한 시간이며 화면 신원 유지·복구에는 사용하지 않는다.
+초기 확인 프레임 수는 3이다. 마지막 검출 뒤 1초 동안 다시 확인되지 않으면 `TRACK_MISSING`으로
+화면 표시만 지우고 내부 ID를 30초 보관한다. 그 안에 IoU로 다시 연결되면 `TRACK_REAPPEARED`를
+내며, 이전 이름은 `이름?`으로만 표시한다. 재등장자는 같은 기술 Track을 쓰되 새
+ObservationSession에서 얼굴 표본을 다시 검증한다. 검증 전 이름은 확정 표시하지 않는다.
 
 ## 신원 상태 흐름
 
@@ -60,7 +61,7 @@ flowchart LR
     A --> P[IdentityPolicy: PersonProfile별 근거 평가]
     P --> U[ObservationSession.current_identity: ANALYZING]
     P --> I[ObservationSession.current_identity: IDENTIFIED / Profile ID]
-    P --> E[ObservationSession.current_identity: EXTERNAL]
+    P --> E[ObservationSession.current_identity: UNREGISTERED]
 ```
 
 과거 `IdentityDecision`은 이력으로 남는다. 현재 결과는 독립 객체가 아니라
@@ -68,26 +69,26 @@ flowchart LR
 
 최상위 검색 결과가 있다고 바로 등록 인물 근거가 되지는 않는다. `IdentityPolicy`가 유사도를
 등록 인물 인정 임계값과 비교해 근거 여부를 정한다. 같은 PersonProfile의 근거가 서로 다른
-FaceSample 2개에서 확인되면 `IDENTIFIED`, 등록 인물 근거가 없는 FaceSample이 3개면
-`EXTERNAL`이며, 그 전에는 `ANALYZING`이다.
+FaceSample 2개에서 확인되면 `IDENTIFIED`, 고품질·비중복 FaceSample이 최대 5개까지도
+등록 인물 근거를 만들지 못하면 `UNREGISTERED`이며, 그 전에는 `ANALYZING`이다.
 
 ## 로컬 운영 신원 판단
 
 로컬 운영은 SQLite의 등록 템플릿 전체를 읽어 NumPy cosine similarity로
 최상위 후보를 찾는다. 표본별 검색 결과는 `identity_decisions`에 저장하고,
 `IdentityPolicy`가 같은 프로필의 인정 근거 두 개를 확인하면 `IDENTIFIED`로 확정한다.
-등록 인물 근거가 없는 표본 세 개는 `EXTERNAL`로 확정한다. 등록 인물 인정 임계값은
+등록 인물 근거가 없는 표본은 최대 5개까지 추가로 검증한 뒤 `UNREGISTERED`로 전환한다. 등록 인물 인정 임계값은
 현재 초기값 `0.60`이며 실제 카메라 보정 대상이다.
 
-## 외부인 등록 흐름
+## 임시 인물 등록 흐름
 
-`EXTERNAL`은 "검색 후보가 전혀 없다"가 아니라, 충분한 고품질·비중복 표본을
-확인했지만 현재 `IdentityPolicy`를 통과해 식별할 수 있는 사람이 없다는 뜻이다.
+`UNREGISTERED`는 "외부인" 판정이 아니다. 충분한 고품질·비중복 표본을
+확인했지만 현재 등록 프로필로 확인되지 않아 임시 코드로 관찰하는 상태다.
 등록 제안은 이 결과가 확정된 뒤에만 가능하다.
 
 ```mermaid
 flowchart TD
-    U[EXTERNAL current identity] --> C{등록 정책의 표본 조건 충족?}
+    U[UNREGISTERED current identity] --> C{등록 정책의 표본 조건 충족?}
     C -->|아니오| X[이 세션에서는 등록 제안 없음]
     C -->|예| P[RegistrationProposal 생성: 세션당 1회]
     P --> NAME[Terminal 이름 입력]
@@ -110,23 +111,23 @@ pgvector는 PostgreSQL 내부의 검색 인덱스이므로, PersonProfile·템�
 빈 입력·만료·등록 실패는 프로필과 템플릿을
 생성하지 않을 뿐, 수집된 고품질 표본 이력은 유지한다.
 
-등록이 완료돼도 현재 ObservationSession의 `EXTERNAL` 결과를 다시 `IDENTIFIED`로 바꾸지
-않는다. FaceSample당 하나의 불변 IdentityDecision만 보존한다는 규칙과, `EXTERNAL` 확정 뒤
+등록이 완료돼도 현재 ObservationSession의 `UNREGISTERED` 결과를 다시 `IDENTIFIED`로 바꾸지
+않는다. FaceSample당 하나의 불변 IdentityDecision만 보존한다는 규칙과, `UNREGISTERED` 확정 뒤
 FaceSample 수집을 끝낸다는 규칙을 지키기 위해서다. 이후 카메라에 새로 나타나 새
 ObservationSession이 시작되면 등록된 템플릿을 검색 대상으로 사용한다.
 
 ### 로컬 운영 등록
 
-로컬 운영은 SQLite 검색을 사용한다. `IDENTIFIED` 또는 `EXTERNAL` 전에는
-FaceSample 수를 전역 개수로 제한하지 않는다. `EXTERNAL`이 세 번째 등록 인물 근거 없는
+로컬 운영은 SQLite 검색을 사용한다. `IDENTIFIED` 또는 `UNREGISTERED` 전에는
+FaceSample 수를 최대 5개로 제한한다. `UNREGISTERED`가 다섯 번째 등록 인물 근거 없는
 표본에서 확정되면 별도 Terminal 입력 작업자가 이름을 한 번 요청한다. 빈 입력은 취소이고,
-Terminal에서 `Y`로 등록을 확인한 뒤 이름을 입력하면 외부인 판정에 사용된 세 FaceSample의 임베딩으로 SQLite PersonProfile과
-템플릿 3개를 만든다. 등록이 끝난 현재 Track의 카메라
+Terminal에서 `Y`로 등록을 확인한 뒤 이름을 입력하면 임시 인물 판정에 사용된 FaceSample의 임베딩으로 SQLite PersonProfile과
+템플릿을 만든다. 등록이 끝난 현재 Track의 카메라
 표시는 입력한 이름으로 즉시 바뀐다. 이후 새 Track은 저장된 템플릿을 검색해 같은
 프로필의 근거가 두 개 쌓이면 그 이름을 표시한다.
 
 SQLite에서도 Terminal 입력 전에 `registration_proposals`의 `PENDING` 레코드를 먼저
-만든다. 빈 입력은 `REJECTED`, 30분 무응답은 `EXPIRED`, 이름 입력 뒤 프로필·템플릿 저장이
+만든다. 빈 입력은 `REJECTED`, 1시간 무응답은 `EXPIRED`, 이름 입력 뒤 프로필·템플릿 저장이
 성공하면 `ACCEPTED`와 `REGISTERED` 처리 결과를 기록한다. 저장 오류는 `FAILED` 처리 결과로
 보존한다.
 
@@ -164,8 +165,8 @@ yaw·pitch·roll 값을 사용한다. 통과 하한은 검출 신뢰도 `0.375`,
 
 자세값은 FaceSample 메타데이터와 로그에 기록하며, 위 초기 범위를 벗어나면 표본을 거부한다.
 
-`EXTERNAL` 확정 뒤에는 FaceSample을 추가로 수집하지 않는다. 등록 제안은 외부인 판정에
-실제로 사용된 FaceSample 세 개를 참조하며, 이름 입력 뒤 그 세 임베딩을 새 PersonProfile의
+`UNREGISTERED` 확정 뒤에는 FaceSample을 추가로 수집하지 않는다. 등록 제안은 임시 인물 판정에
+실제로 사용된 최대 다섯 FaceSample을 참조하며, 이름 입력 뒤 그 임베딩을 새 PersonProfile의
 템플릿으로 연결한다. 등록을 위한 별도 자세·방향 조건이나 표본 재선별은 두지 않는다.
 
 ### 중복 판정
