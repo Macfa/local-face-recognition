@@ -1,3 +1,4 @@
+# Python 3.9~3.12 only. run.py rejects unsupported interpreters before installation.
 numpy==1.26.4
 opencv-python==4.10.0.84
 ultralytics==8.4.116
