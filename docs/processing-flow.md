@@ -34,7 +34,7 @@ flowchart TD
 | --- | --- | --- |
 | 새 `TRACK_CONFIRMED` | `PersonTrack` 생성 | 새 `ObservationSession` 생성 |
 | 안정적으로 연결된 내부 ID의 확인 결과 | 기존 기술 Track 갱신 | 기존 세션 유지 |
-| `TRACK_ASSOCIATION_UNCERTAIN` | 확정 이름 제거, `VERIFYING` 화면 상태로 전환 | 새 관찰 시작 후 얼굴 표본 재검증 |
+| `TRACK_ASSOCIATION_UNCERTAIN` | 기존 Track·이름 유지, 백그라운드 얼굴 재검증 예약 | 현재 세션 유지; 다른 인물 근거가 누적될 때만 새 세션 생성 |
 | `TRACK_MISSING` | 화면 표시 제거, 30초 기술 Track 보존 및 기존 관찰 세션 LOST 기록 | 유지 |
 | `TRACK_REAPPEARED` | 같은 기술 Track에 새 ObservationSession을 만들고 재검증 시작 | 새 세션 생성 |
 | `TRACK_LOST` | 30초 내 재등장하지 않은 기술 Track 폐기 | 이미 LOST인 세션 이력 유지 |

@@ -11,7 +11,7 @@ from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from time import monotonic
 from typing import Dict, List, Set, Tuple
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import cv2
 import numpy as np
@@ -33,6 +33,7 @@ from .application_services.ports import RegistrationChannel
 from .application_services.registration_coordinator import RegistrationCoordinator, RegistrationRequest
 from .application_services.registration_service import RegistrationService
 from .application_services.face_sample_service import FaceSampleService
+from .application_services.identity_reverification_service import IdentityReverificationService
 from .infrastructure.local_sqlite_repository import LocalSQLiteRepository
 from .infrastructure.telegram_registration_channel import TelegramRegistrationChannel
 from .infrastructure.terminal_registration_channel import TerminalRegistrationChannel
@@ -154,6 +155,7 @@ class _TrackIdentityProjection:
     storage_track_id: int
     display_state: str
     person_name: str | None = None
+    person_profile_id: UUID | None = None
     recovery_name: str | None = None
 
 
@@ -192,6 +194,7 @@ class VisionApplication:
         self._observation_service = ObservationService(self._repository, IdentityPolicy())
         self._registration_service = RegistrationService(self._repository)
         self._face_sample_service = FaceSampleService(self._repository, self._observation_service)
+        self._identity_reverification = IdentityReverificationService()
         self._last_face_attempt_at: Dict[int, float] = {}
         self._analysis_queue: Queue[Tuple[np.ndarray, datetime]] = Queue(maxsize=1)
         self._storage_queue: Queue[object] = Queue()
@@ -209,6 +212,8 @@ class VisionApplication:
         self._registration_codes: Dict[int, str] = {}
         self._lost_tracks: Dict[int, _LostTrack] = {}
         self._identity_projections: Dict[int, _TrackIdentityProjection] = {}
+        self._identity_suspect_tracks: Set[int] = set()
+        self._verification_samples = InMemoryFaceSampleStore()
         self._pending_storage_by_track: Dict[int, int] = {}
 
     def _create_registration_channel(self) -> RegistrationChannel:
@@ -328,7 +333,7 @@ class VisionApplication:
                         storage_track_id = self._start_new_observation(event.internal_id, preserve_recovery_name=True)
                         self._storage_queue.put(_TrackStorageRequest(event, storage_track_id))
                     elif event.kind == "TRACK_ASSOCIATION_UNCERTAIN":
-                        self._restart_uncertain_observation(event)
+                        self._mark_identity_suspect(event)
                 # 2. 프레임 전체 얼굴을 사람 Track에 일대일 귀속한 뒤, 기한이 된 대상만 분석한다.
                 due_people = [person for person in people if self._face_analysis_is_due(person.internal_id)]
                 face_candidates = self._face_analyzer.assign_faces(frame, people, occurred_at) if due_people else {}
@@ -386,6 +391,7 @@ class VisionApplication:
                             item.storage_track_id,
                             result.status,
                             result.person_name,
+                            result.person_profile_id,
                         )
                         if not applied:
                             print(
@@ -468,6 +474,7 @@ class VisionApplication:
                     request.storage_track_id,
                     "IDENTIFIED",
                     outcome.name,
+                    UUID(outcome.person_profile_id) if outcome.person_profile_id else None,
                 )
                 self._clear_registration_pending(request.track_id, request.storage_track_id)
                 print(
@@ -495,7 +502,7 @@ class VisionApplication:
 
     def _face_analysis_is_due(self, track_id: int) -> bool:
         """현재 관찰 세션이 표본을 더 받아야 하고 분석 간격이 지났는지 확인한다."""
-        if self._is_identity_finalized(track_id):
+        if self._is_identity_finalized(track_id) and track_id not in self._identity_suspect_tracks:
             return False
         now = monotonic()
         if now - self._last_face_attempt_at.get(track_id, 0.0) < 0.8:
@@ -552,6 +559,10 @@ class VisionApplication:
             )
             return overlay
         self._log_analysis_message(f"track_id={person.internal_id} face_embedding=created")
+        if self._is_identity_suspect(person.internal_id):
+            result = self._reverify_suspect_identity(person.internal_id, candidate, embedding, quality)
+            if result == "INCONCLUSIVE" or result == "CONFIRMED":
+                return overlay
         saved, similarity, duplicate_reason = self._samples.add_if_non_duplicate(candidate, embedding, quality)
         if not saved:
             self._log_analysis_message(
@@ -579,6 +590,82 @@ class VisionApplication:
             )
         )
         return overlay
+
+    def _mark_identity_suspect(self, event: TrackEvent) -> None:
+        """교차가 의심될 때 Track·이름을 유지한 채 얼굴 재검증만 예약한다."""
+        with self._snapshot_lock:
+            projection = self._identity_projections.get(event.internal_id)
+            if (
+                projection is None
+                or projection.display_state != "VERIFIED"
+                or projection.person_profile_id is None
+            ):
+                return
+            if event.internal_id in self._identity_suspect_tracks:
+                return
+            self._identity_suspect_tracks.add(event.internal_id)
+        self._verification_samples.clear(event.internal_id)
+        self._identity_reverification.clear(event.internal_id)
+        self._log_analysis_message(
+            f"identity_reverification=scheduled track_id={event.internal_id} reason=association_uncertain"
+        )
+
+    def _is_identity_suspect(self, track_id: int) -> bool:
+        """현재 Track이 기존 이름을 유지한 채 얼굴 재검증 중인지 반환한다."""
+        with self._snapshot_lock:
+            return track_id in self._identity_suspect_tracks
+
+    def _reverify_suspect_identity(
+        self,
+        track_id: int,
+        candidate: FaceCandidate,
+        embedding: np.ndarray,
+        quality: FaceQuality,
+    ) -> str:
+        """의심 Track의 비중복 얼굴 근거를 누적하고 충돌 때만 새 관찰을 시작한다."""
+        accepted, similarity, reason = self._verification_samples.add_if_non_duplicate(
+            candidate,
+            embedding,
+            quality,
+        )
+        if not accepted:
+            similarity_text = "none" if similarity is None else f"{similarity:.4f}"
+            self._log_analysis_message(
+                f"identity_reverification=duplicate track_id={track_id} reason={reason} similarity={similarity_text}"
+            )
+            return "INCONCLUSIVE"
+        with self._snapshot_lock:
+            projection = self._identity_projections.get(track_id)
+            current_profile_id = None if projection is None else projection.person_profile_id
+        if current_profile_id is None:
+            return "INCONCLUSIVE"
+        result = self._identity_reverification.observe(
+            track_id,
+            current_profile_id,
+            self._repository.search_active_profile_candidates(embedding),
+        )
+        if result.status == "CONFIRMED":
+            with self._snapshot_lock:
+                self._identity_suspect_tracks.discard(track_id)
+            self._verification_samples.clear(track_id)
+            self._log_analysis_message(f"identity_reverification=confirmed track_id={track_id}")
+            return result.status
+        if result.status == "CONFLICT":
+            previous_storage_track_id = self._storage_track_id_for(track_id)
+            transition = TrackEvent("TRACK_MISSING", track_id, candidate.captured_at)
+            self._storage_queue.put(_TrackStorageRequest(transition, previous_storage_track_id))
+            self._mark_track_lost(transition, previous_storage_track_id)
+            new_storage_track_id = self._start_new_observation(track_id)
+            self._storage_queue.put(
+                _TrackStorageRequest(
+                    TrackEvent("TRACK_ASSOCIATION_UNCERTAIN", track_id, candidate.captured_at),
+                    new_storage_track_id,
+                )
+            )
+            self._log_analysis_message(
+                f"identity_reverification=conflict track_id={track_id} new_observation_started=true"
+            )
+        return result.status
 
     def _request_registration(self, track_id: int, storage_track_id: int, proposal_id: str) -> None:
         """한 미등록 Track에 불변 임시 코드를 붙여 이름 입력을 한 번만 요청한다."""
@@ -608,6 +695,7 @@ class VisionApplication:
         storage_track_id: int,
         status: str,
         person_name: str | None,
+        person_profile_id: UUID | None,
     ) -> bool:
         """현재 관찰 세션 결과만 해당 기술 Track의 화면 투영에 반영한다.
 
@@ -622,6 +710,7 @@ class VisionApplication:
                     storage_track_id,
                     "VERIFIED",
                     person_name,
+                    person_profile_id,
                 )
             elif status == "UNREGISTERED":
                 self._identity_projections[track_id] = _TrackIdentityProjection(storage_track_id, "UNREGISTERED")
@@ -667,18 +756,11 @@ class VisionApplication:
             self._registration_pending_tracks.discard(track_id)
             self._registration_requested_tracks.discard(track_id)
             self._registration_codes.pop(track_id, None)
+            self._identity_suspect_tracks.discard(track_id)
         self._samples.clear(track_id)
+        self._verification_samples.clear(track_id)
+        self._identity_reverification.clear(track_id)
         return storage_track_id
-
-    def _restart_uncertain_observation(self, event: TrackEvent) -> None:
-        """다인 Track 연결이 애매해진 대상을 새 얼굴 검증으로 전환한다."""
-        previous_storage_track_id = self._storage_track_id_for(event.internal_id)
-        self._clear_active_track_projection(event.internal_id)
-        missing_event = TrackEvent("TRACK_MISSING", event.internal_id, event.occurred_at)
-        self._storage_queue.put(_TrackStorageRequest(missing_event, previous_storage_track_id))
-        self._mark_track_lost(missing_event, previous_storage_track_id)
-        storage_track_id = self._start_new_observation(event.internal_id)
-        self._storage_queue.put(_TrackStorageRequest(event, storage_track_id))
 
     def _mark_track_lost(self, event: TrackEvent, storage_track_id: int) -> None:
         """MISSING 관찰 세션을 과거 이력의 10분 종료 대기 상태로 전환한다."""

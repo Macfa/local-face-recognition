@@ -5,3 +5,4 @@ ultralytics==8.4.116
 insightface==1.0.1
 onnxruntime==1.19.2
 Pillow==10.4.0
+scipy==1.13.1

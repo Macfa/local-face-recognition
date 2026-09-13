@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import numpy as np
+from uuid import UUID
 from ..components.types import FaceCandidate, FaceQuality
 from ..domain import FacePose, FaceQualitySummary, FaceSample, FaceSampleEmbedding, IdentityDecision, RegistrationProposal
 from .observation_service import ObservationService
@@ -16,11 +17,13 @@ class FaceSampleResult:
         status: str. FAILED, DISCARDED, ANALYZING, IDENTIFIED, UNREGISTERED 중 결과 상태.
         person_name: str | None. IDENTIFIED일 때 화면에 표시할 이름.
         proposal_id: str | None. UNREGISTERED일 때 생성된 임시 코드·등록 제안 ID.
+        person_profile_id: UUID | None. IDENTIFIED일 때 확인된 등록 프로필 키.
         error: str | None. FAILED일 때 오류 설명.
     """
     status: str
     person_name: str | None
     proposal_id: str | None
+    person_profile_id: UUID | None = None
     error: str | None = None
 
 class FaceSampleService:
@@ -67,6 +70,6 @@ class FaceSampleService:
                 )
                 if self._repository.save_registration_proposal(proposal):
                     proposal_id = str(proposal.id)
-            return FaceSampleResult(identity.status.value,name,proposal_id)
+            return FaceSampleResult(identity.status.value,name,proposal_id,identity.person_profile_id)
         except Exception as error:
-            return FaceSampleResult("FAILED",None,None,str(error))
+            return FaceSampleResult("FAILED",None,None,None,str(error))

@@ -14,10 +14,12 @@ class RegistrationOutcome:
     Attributes:
         status: str. REGISTERED, REJECTED, FAILED 중 처리 결과.
         name: str | None. 성공 등록된 프로필 이름.
+        person_profile_id: str | None. 성공 등록된 프로필 키.
         error: str | None. 실패 원인.
     """
     status: str
     name: str | None = None
+    person_profile_id: str | None = None
     error: str | None = None
 
 class RegistrationService:
@@ -53,7 +55,7 @@ class RegistrationService:
                 raise RuntimeError("Registration proposal face samples are unavailable.")
             templates = [profile.add_face_template(sample, at) for sample in samples]
             profile = self._repository.register_person_profile(proposal, profile, templates)
-            return RegistrationOutcome("REGISTERED", profile.name)
+            return RegistrationOutcome("REGISTERED", profile.name, str(profile.id))
         except Exception as error:
             if proposal is not None and proposal.status.value == "ACCEPTED":
                 self._repository.record_registration_failure(proposal, str(error))

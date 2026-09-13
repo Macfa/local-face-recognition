@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 from ultralytics import YOLO
 
 from .types import BBox, PersonDetection, TrackEvent, TrackedPerson
@@ -214,32 +214,19 @@ class IoUPersonTracker:
         track_ids = tuple(self._records.keys())
         if not track_ids or not detections:
             return {}
-        score_rows = tuple(
-            tuple(self._association_score(self._records[track_id], detection.bbox) for detection in detections)
-            for track_id in track_ids
-        )
-
-        @lru_cache(maxsize=None)
-        def choose(track_index: int, used_mask: int) -> Tuple[float, Tuple[int | None, ...]]:
-            if track_index == len(track_ids):
-                return 0.0, ()
-            best_score, tail = choose(track_index + 1, used_mask)
-            best_assignment: Tuple[int | None, ...] = (None,) + tail
-            for detection_index, score in enumerate(score_rows[track_index]):
-                if score is None or used_mask & (1 << detection_index):
-                    continue
-                next_score, next_tail = choose(track_index + 1, used_mask | (1 << detection_index))
-                total = score + next_score
-                if total > best_score:
-                    best_score = total
-                    best_assignment = (detection_index,) + next_tail
-            return best_score, best_assignment
-
-        _, selected = choose(0, 0)
+        # Hungarian assignment keeps the same one-to-one maximum-score policy without
+        # the exponential 2^N search that stalls when a crowded frame has many people.
+        scores = np.zeros((len(track_ids), len(detections)), dtype=np.float64)
+        for track_index, track_id in enumerate(track_ids):
+            for detection_index, detection in enumerate(detections):
+                score = self._association_score(self._records[track_id], detection.bbox)
+                if score is not None:
+                    scores[track_index, detection_index] = score
+        track_indexes, detection_indexes = linear_sum_assignment(-scores)
         return {
-            track_id: detection_index
-            for track_id, detection_index in zip(track_ids, selected)
-            if detection_index is not None
+            track_ids[track_index]: detection_index
+            for track_index, detection_index in zip(track_indexes, detection_indexes)
+            if scores[track_index, detection_index] > 0.0
         }
 
     def _association_score(self, record: _TrackRecord, detection_bbox: BBox) -> float | None:
