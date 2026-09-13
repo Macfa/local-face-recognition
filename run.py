@@ -41,10 +41,30 @@ def main() -> None:
     Returns: None.
     Raises: StartupError. Python·의존성·모델 준비가 불가능할 때.
     """
+    _load_private_environment()
     _ensure_supported_python()
     python = _prepare_runtime_environment()
     _prepare_models()
     _run([str(python), str(PROJECT_ROOT / "local_face_recognition.py")])
+
+
+def _load_private_environment() -> None:
+    """Git에 포함되지 않는 프로젝트 루트 `.env`의 실행 설정을 환경변수로 읽는다.
+
+    셸에서 이미 지정한 값은 덮어쓰지 않는다. 일반적인 `KEY=VALUE` 형식만 읽으며 토큰 값이나
+    파일 내용은 로그에 남기지 않는다.
+    """
+    environment_path = PROJECT_ROOT / ".env"
+    if not environment_path.is_file():
+        return
+    for raw_line in environment_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if key:
+            os.environ.setdefault(key, value)
 
 
 def _prepare_runtime_environment() -> Path:

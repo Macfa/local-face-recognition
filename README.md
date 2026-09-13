@@ -51,14 +51,14 @@ InsightFace, 얼굴 가림 모델을 각 공개 원본에서 자동으로 내려
 
 ### Telegram 등록 채널
 
-기본 등록 채널은 Terminal이다. Telegram Bot을 사용하려면 BotFather에서 받은 토큰과, 등록
-명령을 보낼 운영자 chat ID를 실행 환경변수로만 설정한다. 토큰은 소스·SQLite·Git에 저장하지
-않는다.
+기본 등록 채널은 Terminal이다. Telegram Bot을 사용하려면 GitHub에 포함된
+`.env.example`을 `.env`로 복사한 뒤, BotFather에서 받은 토큰과 등록 명령을 보낼 운영자 chat
+ID를 본인 컴퓨터의 `.env`에만 입력한다. `run.py`가 실행 시 이 파일을 읽으며, `.env`는
+`.gitignore`에 포함되어 소스·SQLite·GitHub에 저장되지 않는다.
 
 ```bash
-export LOCAL_FACE_RECOGNITION_REGISTRATION_CHANNEL=telegram
-export LOCAL_FACE_RECOGNITION_TELEGRAM_BOT_TOKEN='BotFather token'
-export LOCAL_FACE_RECOGNITION_TELEGRAM_ALLOWED_CHAT_ID='authorized chat ID'
+cp .env.example .env
+# Edit .env locally: uncomment Telegram lines and replace placeholders.
 python3.12 run.py
 ```
 
