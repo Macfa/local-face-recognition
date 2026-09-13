@@ -82,7 +82,7 @@ Application은 신원 판단 규칙이나 AI 알고리즘을 직접 갖지 않�
 프로필과 판단 근거는 해당 키가 가리키는 `ObservationSession.current_identity`에서 조회한다.
 `display_state`는 `VERIFYING`, `VERIFIED`, `UNREGISTERED` 중 하나다.
 
-- `VERIFIED`이면서 현재 활성 `ObservationSession`의 `IDENTIFIED` 결과와 세션 ID가 모두
+- `VERIFIED`이면서 현재 활성 `ObservationSession`의 `IDENTIFIED` 결과와 관찰 세션 키가 모두
   일치할 때만 등록 이름을 확정 표시한다.
 - `VERIFYING`에서는 과거 이름을 확정 이름으로 표시하지 않는다. 30초 안의 재등장에는
   `이름?`, 다인 연결이 불확실한 경우에는 `표본 수집 중 | T-...`를 표시한다.

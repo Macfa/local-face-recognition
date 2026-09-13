@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
+import os
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
@@ -28,10 +29,12 @@ from .components import (
 from .components.types import BBox, FaceCandidate, FaceQuality, TrackEvent, TrackedPerson
 from .domain import CurrentIdentityStatus, IdentityPolicy
 from .application_services.observation_service import ObservationService
+from .application_services.ports import RegistrationChannel
 from .application_services.registration_coordinator import RegistrationCoordinator, RegistrationRequest
 from .application_services.registration_service import RegistrationService
 from .application_services.face_sample_service import FaceSampleService
 from .infrastructure.local_sqlite_repository import LocalSQLiteRepository
+from .infrastructure.telegram_registration_channel import TelegramRegistrationChannel
 from .infrastructure.terminal_registration_channel import TerminalRegistrationChannel
 
 
@@ -194,7 +197,7 @@ class VisionApplication:
         self._storage_queue: Queue[object] = Queue()
         self._stop_requested = Event()
         self._registration_coordinator = RegistrationCoordinator()
-        self._registration_channel = TerminalRegistrationChannel(self._stop_requested)
+        self._registration_channel: RegistrationChannel = self._create_registration_channel()
         self._snapshot_lock = Lock()
         self._track_end_delay_seconds = 10 * 60
         self._latest_people: List[Tuple[TrackedPerson, int]] = []
@@ -207,6 +210,26 @@ class VisionApplication:
         self._lost_tracks: Dict[int, _LostTrack] = {}
         self._identity_projections: Dict[int, _TrackIdentityProjection] = {}
         self._pending_storage_by_track: Dict[int, int] = {}
+
+    def _create_registration_channel(self) -> RegistrationChannel:
+        """환경변수로 선택한 Terminal 또는 Telegram 등록 채널 어댑터를 생성한다.
+
+        Raises:
+            RuntimeError. 지원하지 않는 채널이거나 Telegram 필수 환경변수가 없을 때 발생.
+        """
+        channel_name = os.environ.get("LOCAL_FACE_RECOGNITION_REGISTRATION_CHANNEL", "terminal").casefold()
+        if channel_name == "terminal":
+            return TerminalRegistrationChannel(self._stop_requested)
+        if channel_name == "telegram":
+            token = os.environ.get("LOCAL_FACE_RECOGNITION_TELEGRAM_BOT_TOKEN", "")
+            allowed_chat_id = os.environ.get("LOCAL_FACE_RECOGNITION_TELEGRAM_ALLOWED_CHAT_ID", "")
+            if not token or not allowed_chat_id:
+                raise RuntimeError(
+                    "Telegram channel requires LOCAL_FACE_RECOGNITION_TELEGRAM_BOT_TOKEN and "
+                    "LOCAL_FACE_RECOGNITION_TELEGRAM_ALLOWED_CHAT_ID."
+                )
+            return TelegramRegistrationChannel(token, allowed_chat_id, self._stop_requested)
+        raise RuntimeError("LOCAL_FACE_RECOGNITION_REGISTRATION_CHANNEL must be terminal or telegram.")
     def run(self) -> None:
         """카메라 표시 루프와 책임별 작업자를 시작하고 종료를 정리한다.
 

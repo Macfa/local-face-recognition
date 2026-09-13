@@ -21,9 +21,11 @@
 
 ## 로컬 처리 경계
 
-실행 중 카메라 프레임, 얼굴 crop, 임베딩, 신원 검색과 SQLite 데이터는 모두 이 PC 안에서만
-처리한다. 모델 추론은 로컬 ONNX Runtime CPU 실행이며, 외부 API·클라우드 추론·원격 저장소로
-얼굴 정보를 전송하지 않는다.
+기본 실행에서는 카메라 프레임, 얼굴 crop, 임베딩, 신원 검색과 SQLite 데이터가 모두 이 PC
+안에서 처리된다. 모델 추론은 로컬 ONNX Runtime CPU 실행이며, 외부 API·클라우드 추론·원격
+저장소로 얼굴 정보를 전송하지 않는다. Telegram 등록 채널을 명시적으로 선택한 경우에만 임시
+코드와 운영자가 입력한 이름이 Telegram Bot API로 전송되며, 얼굴 이미지와 임베딩은 전송하지
+않는다.
 
 ## 실행
 
@@ -46,6 +48,29 @@ InsightFace, 얼굴 가림 모델을 각 공개 원본에서 자동으로 내려
 종료된다. 현재 실행은 SQLite 기반 로컬 운영 모드다.
 등록 프로필로 확인되지 않으면 임시 코드로 보관하고 터미널에서 이름을 입력해 등록할 수 있으며, 이후 새 Track에서 같은
 인물의 표본 두 개가 확인되면 카메라에 저장된 이름을 표시한다.
+
+### Telegram 등록 채널
+
+기본 등록 채널은 Terminal이다. Telegram Bot을 사용하려면 BotFather에서 받은 토큰과, 등록
+명령을 보낼 운영자 chat ID를 실행 환경변수로만 설정한다. 토큰은 소스·SQLite·Git에 저장하지
+않는다.
+
+```bash
+export LOCAL_FACE_RECOGNITION_REGISTRATION_CHANNEL=telegram
+export LOCAL_FACE_RECOGNITION_TELEGRAM_BOT_TOKEN='BotFather token'
+export LOCAL_FACE_RECOGNITION_TELEGRAM_ALLOWED_CHAT_ID='authorized chat ID'
+python3.12 run.py
+```
+
+Bot은 `임시 인물 U-XXXXXXXX` 요청을 보내며, 운영자는 아래 중 하나로 응답한다.
+
+```text
+/register U-XXXXXXXX 이름
+/reject U-XXXXXXXX
+```
+
+다른 chat ID의 메시지와 현재 활성 코드에 맞지 않는 명령은 무시한다. Telegram은 외부 서비스이므로
+이 모드는 운영자가 명시적으로 선택했을 때만 사용한다.
 
 ## 프로젝트 문서
 

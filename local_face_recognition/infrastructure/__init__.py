@@ -2,5 +2,6 @@
 
 from .local_sqlite_repository import LocalSQLiteRepository
 from .terminal_registration_channel import TerminalRegistrationChannel
+from .telegram_registration_channel import TelegramRegistrationChannel
 
-__all__ = ["LocalSQLiteRepository", "TerminalRegistrationChannel"]
+__all__ = ["LocalSQLiteRepository", "TelegramRegistrationChannel", "TerminalRegistrationChannel"]
