@@ -84,6 +84,7 @@ class _TrackRecord:
     last_seen_at: datetime
     consecutive_hits: int = 1
     confirmed: bool = False
+    missing: bool = False
 
 
 class IoUPersonTracker:
@@ -92,20 +93,23 @@ class IoUPersonTracker:
     def __init__(
         self,
         confirmation_frames: int = 3,
-        lost_after_seconds: float = 1.0,
+        missing_after_seconds: float = 1.0,
+        retain_after_missing_seconds: float = 30.0,
         iou_threshold: float = 0.3,
     ) -> None:
         """추적 확인·상실·상자 연결 정책을 초기화한다.
 
         Args:
             confirmation_frames: int. TRACK_CONFIRMED 전 필요한 연속 연결 수.
-            lost_after_seconds: float. 마지막 검출 후 TRACK_LOST까지 허용 시간.
+            missing_after_seconds: float. 마지막 검출 후 화면에서 잠시 사라졌다고 판단할 시간.
+            retain_after_missing_seconds: float. MISSING 후 동일 기술 Track을 보관할 시간.
             iou_threshold: float. 기존 Track 연결에 필요한 최소 IoU.
         Returns:
             None.
         """
         self._confirmation_frames = confirmation_frames
-        self._lost_after_seconds = lost_after_seconds
+        self._missing_after_seconds = missing_after_seconds
+        self._retain_after_missing_seconds = retain_after_missing_seconds
         self._iou_threshold = iou_threshold
         self._next_id = 1
         self._records: Dict[int, _TrackRecord] = {}
@@ -134,6 +138,10 @@ class IoUPersonTracker:
             record.bbox = detections[detection_index].bbox
             record.consecutive_hits += 1
             record.last_seen_at = occurred_at
+            if record.missing:
+                record.missing = False
+                if record.confirmed:
+                    events.append(TrackEvent("TRACK_REAPPEARED", track_id, occurred_at))
             matched_track_ids.add(track_id)
             remaining_detection_indexes.remove(detection_index)
 
@@ -143,8 +151,13 @@ class IoUPersonTracker:
                     record.confirmed = True
                     events.append(TrackEvent("TRACK_CONFIRMED", track_id, occurred_at))
                 continue
-            record.consecutive_hits = 0
-            if (occurred_at - record.last_seen_at).total_seconds() < self._lost_after_seconds:
+            elapsed_seconds = (occurred_at - record.last_seen_at).total_seconds()
+            if not record.missing and elapsed_seconds >= self._missing_after_seconds:
+                record.missing = True
+                record.consecutive_hits = 0
+                if record.confirmed:
+                    events.append(TrackEvent("TRACK_MISSING", track_id, occurred_at))
+            if elapsed_seconds < self._retain_after_missing_seconds:
                 continue
             if record.confirmed:
                 events.append(TrackEvent("TRACK_LOST", track_id, occurred_at))

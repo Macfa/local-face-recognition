@@ -12,11 +12,11 @@ class CurrentIdentityStatus(str, Enum):
     Values:
         ANALYZING: 표본을 더 모아야 함.
         IDENTIFIED: 등록 PersonProfile로 확인됨.
-        EXTERNAL: 등록 템플릿과 일치하지 않는 외부인.
+        UNREGISTERED: 등록 프로필로 확인되지 않았으나 임시 코드로 보관할 대상.
     """
     ANALYZING = "ANALYZING"
     IDENTIFIED = "IDENTIFIED"
-    EXTERNAL = "EXTERNAL"
+    UNREGISTERED = "UNREGISTERED"
 
 @dataclass(frozen=True)
 class CurrentIdentityResult:
@@ -97,16 +97,19 @@ class IdentityDecision:
         return cls(uuid4(), face_sample_id, candidate.person_profile_id, candidate.person_profile_face_template_id, candidate.similarity, decided_at)
 
 class IdentityPolicy:
-    """세션의 여러 IdentityDecision을 IDENTIFIED·EXTERNAL·ANALYZING으로 누적 판단한다."""
-    def __init__(self, recognition_similarity: float = .60) -> None:
+    """세션의 여러 IdentityDecision을 IDENTIFIED·UNREGISTERED·ANALYZING으로 누적 판단한다."""
+
+    def __init__(self, recognition_similarity: float = .60, maximum_samples: int = 5) -> None:
         """등록 인물로 인정할 최소 코사인 유사도를 설정한다.
 
         Args:
             recognition_similarity: float. 후보 판단을 지지 증거로 셀 하한.
+            maximum_samples: int. 등록 근거가 없을 때 임시 코드로 전환할 최대 표본 수.
         Returns:
             None.
         """
         self._recognition_similarity = recognition_similarity
+        self._maximum_samples = maximum_samples
 
     def evaluate(self, session_id: UUID, decisions: Sequence[IdentityDecision], evaluated_at: datetime) -> CurrentIdentityResult:
         """표본 판단 이력을 누적 규칙으로 현재 신원 결과로 변환한다.
@@ -116,7 +119,7 @@ class IdentityPolicy:
             decisions: Sequence[IdentityDecision]. 세션의 표본별 판단 이력.
             evaluated_at: datetime. 정책 평가 시각.
         Returns:
-            CurrentIdentityResult. 같은 프로필 지지 2개면 IDENTIFIED, 후보 없는 판단 3개면 EXTERNAL.
+            CurrentIdentityResult. 같은 프로필 지지 2개면 IDENTIFIED, 고품질 비중복 표본 5개면 UNREGISTERED.
         """
         grouped: dict[UUID, list[IdentityDecision]] = {}
         for decision in decisions:
@@ -126,6 +129,6 @@ class IdentityPolicy:
         if supported:
             strongest = max((item for values in supported for item in values), key=lambda item: float(item.similarity))
             return CurrentIdentityResult(session_id, CurrentIdentityStatus.IDENTIFIED, strongest.candidate_person_profile_id, strongest.id, evaluated_at)
-        if len(decisions) >= 3 and not grouped:
-            return CurrentIdentityResult(session_id, CurrentIdentityStatus.EXTERNAL, None, None, evaluated_at)
+        if len(decisions) >= self._maximum_samples:
+            return CurrentIdentityResult(session_id, CurrentIdentityStatus.UNREGISTERED, None, None, evaluated_at)
         return CurrentIdentityResult(session_id, CurrentIdentityStatus.ANALYZING, None, None, evaluated_at)

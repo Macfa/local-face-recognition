@@ -138,7 +138,7 @@ class LocalSQLiteRepository:
 
                 CREATE TABLE IF NOT EXISTS observation_session_current_identities (
                     observation_session_id TEXT PRIMARY KEY,
-                    status TEXT NOT NULL CHECK (status IN ('ANALYZING', 'IDENTIFIED', 'EXTERNAL')),
+                    status TEXT NOT NULL CHECK (status IN ('ANALYZING', 'IDENTIFIED', 'UNREGISTERED')),
                     person_profile_id TEXT,
                     identity_decision_id TEXT,
                     evaluated_at TEXT NOT NULL
@@ -191,6 +191,7 @@ class LocalSQLiteRepository:
                 "deleted_at",
             )
             self._remove_legacy_foreign_keys(connection)
+            self._migrate_identity_statuses(connection)
             self._ensure_column(
                 connection,
                 "registration_proposal_face_samples",
@@ -479,7 +480,7 @@ class LocalSQLiteRepository:
     def save_domain_current_identity(self, identity: CurrentIdentityResult) -> None:
         """ObservationSession이 반영한 현재 신원 결과를 저장한다.
 
-        Args: identity: CurrentIdentityResult. 현재 세션의 ANALYZING·IDENTIFIED·EXTERNAL 결과.
+        Args: identity: CurrentIdentityResult. 현재 세션의 ANALYZING·IDENTIFIED·UNREGISTERED 결과.
         Returns: None.
         """
         with self._connect() as connection:
@@ -703,10 +704,62 @@ class LocalSQLiteRepository:
             if updated.rowcount != 1:
                 raise RuntimeError("The registration proposal cannot be expired.")
 
+    def purge_expired_unregistered_data(self, now: datetime) -> int:
+        """응답 없이 끝난 임시 인물의 crop·임베딩·판단·제안을 완전 삭제한다."""
+        crop_paths: list[Path] = []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT registration_proposals.id, registration_proposal_face_samples.face_sample_id,
+                       face_samples.face_crop_path
+                FROM registration_proposals
+                JOIN registration_proposal_face_samples
+                    ON registration_proposal_face_samples.registration_proposal_id = registration_proposals.id
+                JOIN face_samples ON face_samples.id = registration_proposal_face_samples.face_sample_id
+                WHERE registration_proposals.status IN ('REJECTED', 'EXPIRED')
+                  AND registration_proposals.expires_at <= ?
+                """,
+                (now.isoformat(),),
+            ).fetchall()
+            proposal_ids = {row[0] for row in rows}
+            sample_ids = {row[1] for row in rows}
+            crop_paths = [Path(row[2]) for row in rows]
+            if not proposal_ids:
+                return 0
+            proposal_placeholders = ", ".join("?" for _ in proposal_ids)
+            sample_placeholders = ", ".join("?" for _ in sample_ids)
+            connection.execute(
+                f"DELETE FROM registration_handlings WHERE registration_proposal_id IN ({proposal_placeholders})",
+                list(proposal_ids),
+            )
+            connection.execute(
+                f"DELETE FROM registration_proposal_face_samples WHERE registration_proposal_id IN ({proposal_placeholders})",
+                list(proposal_ids),
+            )
+            connection.execute(
+                f"DELETE FROM identity_decisions WHERE face_sample_id IN ({sample_placeholders})",
+                list(sample_ids),
+            )
+            connection.execute(
+                f"DELETE FROM face_sample_embeddings WHERE face_sample_id IN ({sample_placeholders})",
+                list(sample_ids),
+            )
+            connection.execute(
+                f"DELETE FROM face_samples WHERE id IN ({sample_placeholders})",
+                list(sample_ids),
+            )
+            connection.execute(
+                f"DELETE FROM registration_proposals WHERE id IN ({proposal_placeholders})",
+                list(proposal_ids),
+            )
+        for crop_path in crop_paths:
+            crop_path.unlink(missing_ok=True)
+        return len(proposal_ids)
+
     def save_registration_proposal(self, proposal: RegistrationProposal) -> bool:
         """도메인이 만든 등록 제안과 선택된 FaceSample 관계를 한 번만 저장한다.
 
-        Args: proposal: RegistrationProposal. 외부인 판정 근거 표본을 가진 PENDING 제안.
+        Args: proposal: RegistrationProposal. 임시 인물 판정 근거 표본을 가진 PENDING 제안.
         Returns: bool. 새로 저장했으면 ``True``, 세션에 기존 제안이 있으면 ``False``.
         Raises: RuntimeError. 세션·표본 귀속 관계가 유효하지 않을 때.
         """
@@ -793,6 +846,38 @@ class LocalSQLiteRepository:
                 """,
                 (str(proposal.id), proposal.responded_at.isoformat(), failure_reason),
             )
+
+    @staticmethod
+    def _migrate_identity_statuses(connection: sqlite3.Connection) -> None:
+        """기존 EXTERNAL 상태 제약을 UNREGISTERED 상태 제약으로 데이터 보존 마이그레이션한다."""
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'observation_session_current_identities'"
+        ).fetchone()
+        if row is None or "UNREGISTERED" in str(row[0]):
+            return
+        connection.execute("ALTER TABLE observation_session_current_identities RENAME TO old_current_identities")
+        connection.execute(
+            """
+            CREATE TABLE observation_session_current_identities (
+                observation_session_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL CHECK (status IN ('ANALYZING', 'IDENTIFIED', 'UNREGISTERED')),
+                person_profile_id TEXT,
+                identity_decision_id TEXT,
+                evaluated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO observation_session_current_identities
+            (observation_session_id, status, person_profile_id, identity_decision_id, evaluated_at)
+            SELECT observation_session_id,
+                   CASE status WHEN 'EXTERNAL' THEN 'UNREGISTERED' ELSE status END,
+                   person_profile_id, identity_decision_id, evaluated_at
+            FROM old_current_identities
+            """
+        )
+        connection.execute("DROP TABLE old_current_identities")
 
     @staticmethod
     def _remove_legacy_foreign_keys(connection: sqlite3.Connection) -> None:

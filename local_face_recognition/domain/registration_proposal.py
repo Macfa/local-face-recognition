@@ -1,4 +1,4 @@
-"""외부인 등록 제안 엔티티다."""
+"""임시 인물 등록 제안 엔티티다."""
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -7,7 +7,7 @@ from typing import Sequence
 from uuid import UUID, uuid4
 
 class RegistrationProposalStatus(str, Enum):
-    """외부인 표본을 등록할지 결정하는 제안의 생명 주기 상태다."""
+    """임시 인물 표본을 등록할지 결정하는 제안의 생명 주기 상태다."""
     PENDING = "PENDING"
     ACCEPTED = "ACCEPTED"
     REJECTED = "REJECTED"
@@ -15,13 +15,13 @@ class RegistrationProposalStatus(str, Enum):
 
 @dataclass
 class RegistrationProposal:
-    """외부인 판정에 사용한 FaceSample을 등록으로 전환하는 도메인 엔티티다.
+    """임시 인물 판정에 사용한 FaceSample을 등록으로 전환하는 도메인 엔티티다.
 
     Attributes:
-        id: UUID. 제안과 화면 외부인 코드를 만드는 식별자.
+        id: UUID. 제안과 화면 임시 인물 코드를 만드는 식별자.
         observation_session_id: UUID. 제안의 근거가 된 관찰 세션.
         face_sample_ids: Sequence[UUID]. 등록 템플릿으로 쓸 검증 통과 표본 순서.
-        created_at: datetime. 외부인 판정 시각.
+        created_at: datetime. 임시 인물 전환 시각.
         expires_at: datetime. 운영자 응답 마감 시각.
         status: RegistrationProposalStatus. 현재 제안 상태.
         accepted_name: str | None. 승인 시 입력된 이름.
@@ -38,7 +38,7 @@ class RegistrationProposal:
 
     @classmethod
     def create(cls, session_id: UUID, face_sample_ids: Sequence[UUID], created_at: datetime) -> "RegistrationProposal":
-        """외부인 판정의 근거 표본으로 30분짜리 등록 제안을 생성한다.
+        """임시 인물 판정의 근거 표본으로 1시간짜리 등록 제안을 생성한다.
 
         Args: session_id: UUID. 현재 관찰 세션. face_sample_ids: Sequence[UUID]. 검증된 표본들.
             created_at: datetime. 제안 생성 시각.
@@ -47,7 +47,7 @@ class RegistrationProposal:
         """
         if not face_sample_ids:
             raise ValueError("RegistrationProposal requires FaceSamples.")
-        return cls(uuid4(), session_id, tuple(face_sample_ids), created_at, created_at + timedelta(minutes=30), RegistrationProposalStatus.PENDING, None, None)
+        return cls(uuid4(), session_id, tuple(face_sample_ids), created_at, created_at + timedelta(hours=1), RegistrationProposalStatus.PENDING, None, None)
 
     def accept(self, name: str, responded_at: datetime) -> None:
         """유효 기한 안의 PENDING 제안을 이름과 함께 ACCEPTED로 전이한다.

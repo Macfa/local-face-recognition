@@ -52,7 +52,7 @@ class ObservationSession:
         """현재 세션이 FaceSample을 더 받을 수 있는지 반환한다.
 
         Returns:
-            bool. ACTIVE이며 신원이 ANALYZING일 때만 True.
+            bool. ACTIVE이며 신원이 ANALYZING일 때만 True. IDENTIFIED 또는 UNREGISTERED면 False.
         """
         return self.status is ObservationSessionStatus.ACTIVE and self.current_identity.status is CurrentIdentityStatus.ANALYZING
 

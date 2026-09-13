@@ -75,3 +75,7 @@ class RegistrationService:
             self._repository.save_registration_expiration(proposal)
             expired_proposal_ids.append(str(proposal.id))
         return expired_proposal_ids
+
+    def purge_expired_unregistered_data(self, now: datetime) -> int:
+        """1시간이 지난 미등록 임시 코드와 연결된 생체 데이터를 완전 삭제한다."""
+        return self._repository.purge_expired_unregistered_data(now)

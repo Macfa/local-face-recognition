@@ -13,9 +13,9 @@ class FaceSampleResult:
     """FaceSample 처리 유스케이스의 호출자 반환 DTO.
 
     Attributes:
-        status: str. FAILED, DISCARDED, ANALYZING, IDENTIFIED, EXTERNAL 중 결과 상태.
+        status: str. FAILED, DISCARDED, ANALYZING, IDENTIFIED, UNREGISTERED 중 결과 상태.
         person_name: str | None. IDENTIFIED일 때 화면에 표시할 이름.
-        proposal_id: str | None. EXTERNAL일 때 생성된 등록 제안 ID.
+        proposal_id: str | None. UNREGISTERED일 때 생성된 임시 코드·등록 제안 ID.
         error: str | None. FAILED일 때 오류 설명.
     """
     status: str
@@ -59,7 +59,7 @@ class FaceSampleService:
             identity=self._observations.apply_identity(storage_track_id,decisions,candidate.captured_at)
             name=self._repository.find_active_profile_name(identity.person_profile_id) if identity.person_profile_id else None
             proposal_id = None
-            if identity.status.value == "EXTERNAL":
+            if identity.status.value == "UNREGISTERED":
                 proposal = RegistrationProposal.create(
                     context.session.id,
                     [decision.face_sample_id for decision in decisions],

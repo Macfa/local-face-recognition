@@ -78,7 +78,7 @@ class FaceSampleRepository(ObservationRepository, Protocol):
         ...
 
     def save_registration_proposal(self, proposal: RegistrationProposal) -> bool:
-        """외부인 등록 제안을 한 번만 저장하고 성공 여부를 반환한다."""
+        """임시 인물 등록 제안을 한 번만 저장하고 성공 여부를 반환한다."""
         ...
 
 
@@ -99,6 +99,10 @@ class RegistrationRepository(Protocol):
 
     def save_registration_expiration(self, proposal: RegistrationProposal) -> None:
         """시간 초과된 등록 제안의 만료 전이를 저장한다."""
+        ...
+
+    def purge_expired_unregistered_data(self, now: datetime) -> int:
+        """만료된 미등록 제안의 얼굴 표본과 임시 등록 정보를 완전 삭제한다."""
         ...
 
     def load_face_samples(self, face_sample_ids: Sequence[object]) -> list[FaceSample]:

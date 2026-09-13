@@ -136,6 +136,7 @@ class _LostTrack:
     """화면에서 사라진 뒤 종료 대기 중인 추적의 시각과 저장 키다."""
 
     storage_track_id: int
+    technical_track_id: int
     lost_at: datetime
 
 
@@ -189,6 +190,7 @@ class VisionApplication:
         self._registration_codes: Dict[int, str] = {}
         self._registered_names: Dict[int, str] = {}
         self._lost_tracks: Dict[int, _LostTrack] = {}
+        self._recovery_labels: Dict[int, str] = {}
         self._pending_storage_by_track: Dict[int, int] = {}
     def run(self) -> None:
         """카메라 표시 루프와 책임별 작업자를 시작하고 종료를 정리한다.
@@ -274,12 +276,18 @@ class VisionApplication:
                 people, events = self._tracker.update(self._detector.detect(frame), occurred_at)
                 self._log_events(events)
                 for event in events:
-                    self._storage_queue.put(
-                        _TrackStorageRequest(event, self._storage_track_id_for(event.internal_id))
-                    )
-                    if event.kind == "TRACK_LOST":
-                        self._clear_active_track_projection(event.internal_id)
-                        self._mark_track_lost(event)
+                    if event.kind == "TRACK_CONFIRMED":
+                        self._storage_queue.put(
+                            _TrackStorageRequest(event, self._storage_track_id_for(event.internal_id))
+                        )
+                    elif event.kind == "TRACK_MISSING":
+                        self._clear_active_track_projection(event.internal_id, preserve_recovery_label=True)
+                        storage_track_id = self._storage_track_id_for(event.internal_id)
+                        self._storage_queue.put(_TrackStorageRequest(event, storage_track_id))
+                        self._mark_track_lost(event, storage_track_id)
+                    elif event.kind == "TRACK_REAPPEARED":
+                        storage_track_id = self._begin_reverification(event.internal_id)
+                        self._storage_queue.put(_TrackStorageRequest(event, storage_track_id))
                 # 2. 확정 대상별 얼굴 분석과 중복 차단을 수행하고 통과 표본만 저장으로 넘긴다.
                 for person in people:
                     overlay = self._analyze_face_if_due(frame, person, occurred_at)
@@ -308,8 +316,10 @@ class VisionApplication:
                     # 1. 기술 Track 이벤트를 도메인 Track·관찰 세션 전이로 저장한다.
                     if item.event.kind == "TRACK_CONFIRMED":
                         self._observation_service.start(item.storage_track_id, item.event.occurred_at)
-                    elif item.event.kind == "TRACK_LOST":
+                    elif item.event.kind == "TRACK_MISSING":
                         self._observation_service.mark_lost(item.storage_track_id, item.event.occurred_at)
+                    elif item.event.kind == "TRACK_REAPPEARED":
+                        self._observation_service.start(item.storage_track_id, item.event.occurred_at)
                     print(
                         f"observation_transition=stored event={item.event.kind} track_id={item.event.internal_id}",
                         flush=True,
@@ -325,7 +335,7 @@ class VisionApplication:
                         self._apply_identity(item.candidate.track_id, result.status, result.person_name)
                         print(f"identity_result=applied track_id={item.candidate.track_id} status={result.status}", flush=True)
                         if result.proposal_id is not None:
-                            # 3. 외부인 등록 제안은 FIFO 등록 조율기로 넘긴다.
+                            # 3. 임시 인물 등록 제안은 FIFO 등록 조율기로 넘긴다.
                             self._request_registration(item.candidate.track_id, item.storage_track_id, result.proposal_id)
             except Exception as error:
                 _log_operational_failure("storage_worker", error)
@@ -488,7 +498,7 @@ class VisionApplication:
         return overlay
 
     def _request_registration(self, track_id: int, storage_track_id: int, proposal_id: str) -> None:
-        """한 외부인 Track에 불변 등록 코드를 붙여 이름 입력을 한 번만 요청한다."""
+        """한 미등록 Track에 불변 임시 코드를 붙여 이름 입력을 한 번만 요청한다."""
         display_code = self._registration_code_for(proposal_id)
         with self._snapshot_lock:
             if track_id in self._registration_requested_tracks:
@@ -508,6 +518,8 @@ class VisionApplication:
     def _apply_identity(self, track_id: int, status: str, person_name: str | None) -> None:
         """식별 완료된 이름만 화면용 투영 값으로 반영한다."""
         with self._snapshot_lock:
+            if status in {"IDENTIFIED", "UNREGISTERED"}:
+                self._recovery_labels.pop(track_id, None)
             if status == "IDENTIFIED" and person_name is not None:
                 self._registered_names[track_id] = person_name
 
@@ -529,23 +541,41 @@ class VisionApplication:
             if storage_track_id is None:
                 storage_track_id = uuid4().int & ((1 << 63) - 1)
                 self._storage_track_ids[track_id] = storage_track_id
-            return storage_track_id
+        return storage_track_id
 
-    def _mark_track_lost(self, event: TrackEvent) -> None:
-        """TRACK_LOST를 과거 세션의 10분 종료 대기 상태로 전환한다."""
+    def _begin_reverification(self, track_id: int) -> int:
+        """30초 보존 Track의 재등장에 새 관찰 세션과 얼굴 검증을 시작한다."""
         with self._snapshot_lock:
-            self._lost_tracks[event.internal_id] = _LostTrack(
-                self._storage_track_ids[event.internal_id],
+            storage_track_id = uuid4().int & ((1 << 63) - 1)
+            self._storage_track_ids[track_id] = storage_track_id
+            self._last_face_attempt_at.pop(track_id, None)
+            self._registration_pending_tracks.discard(track_id)
+            self._registration_requested_tracks.discard(track_id)
+        self._samples.clear(track_id)
+        return storage_track_id
+
+    def _mark_track_lost(self, event: TrackEvent, storage_track_id: int) -> None:
+        """MISSING 관찰 세션을 과거 이력의 10분 종료 대기 상태로 전환한다."""
+        with self._snapshot_lock:
+            self._lost_tracks[storage_track_id] = _LostTrack(
+                storage_track_id,
+                event.internal_id,
                 event.occurred_at,
             )
 
-    def _clear_active_track_projection(self, track_id: int) -> None:
-        """상실된 기술 Track의 화면 이름·등록 대기·얼굴 오버레이를 즉시 폐기한다."""
+    def _clear_active_track_projection(self, track_id: int, *, preserve_recovery_label: bool = False) -> None:
+        """잠시 사라진 기술 Track의 화면 투영을 지우고 필요하면 재검증 라벨을 보존한다."""
         with self._snapshot_lock:
             self._analysis_faces.pop(track_id, None)
             self._latest_faces.pop(track_id, None)
             self._latest_people = [item for item in self._latest_people if item[0].internal_id != track_id]
-            self._registered_names.pop(track_id, None)
+            name = self._registered_names.pop(track_id, None)
+            code = self._registration_codes.get(track_id)
+            if preserve_recovery_label:
+                if name is not None:
+                    self._recovery_labels[track_id] = name
+                elif code is not None:
+                    self._recovery_labels[track_id] = f"임시 인물 | {code}"
             self._registration_pending_tracks.discard(track_id)
 
     def _start_storage_work(self, track_id: int) -> None:
@@ -566,12 +596,12 @@ class VisionApplication:
         """10분 동안 LOST이고 저장 작업이 끝난 Track을 종료·정리한다."""
         with self._snapshot_lock:
             finishable = [
-                (track_id, lost_track)
-                for track_id, lost_track in self._lost_tracks.items()
+                (storage_track_id, lost_track)
+                for storage_track_id, lost_track in self._lost_tracks.items()
                 if (now - lost_track.lost_at).total_seconds() >= self._track_end_delay_seconds
                 and self._pending_storage_by_track.get(track_id, 0) == 0
             ]
-        for track_id, lost_track in finishable:
+        for storage_track_id, lost_track in finishable:
             try:
                 ended = self._observation_service.end_if_possible(lost_track.storage_track_id, now)
             except Exception as error:
@@ -580,15 +610,18 @@ class VisionApplication:
             if not ended:
                 continue
             with self._snapshot_lock:
-                self._lost_tracks.pop(track_id, None)
-                self._last_face_attempt_at.pop(track_id, None)
-                self._registration_pending_tracks.discard(track_id)
-                self._registration_requested_tracks.discard(track_id)
-                self._registration_codes.pop(track_id, None)
-                self._registered_names.pop(track_id, None)
-                self._storage_track_ids.pop(track_id, None)
-            self._samples.clear(track_id)
-            print(f"event=TRACK_ENDED track_id={track_id} at={now.isoformat()}", flush=True)
+                self._lost_tracks.pop(storage_track_id, None)
+                track_id = lost_track.technical_track_id
+                if self._storage_track_ids.get(track_id) == storage_track_id:
+                    self._last_face_attempt_at.pop(track_id, None)
+                    self._registration_pending_tracks.discard(track_id)
+                    self._registration_requested_tracks.discard(track_id)
+                    self._registration_codes.pop(track_id, None)
+                    self._registered_names.pop(track_id, None)
+                    self._recovery_labels.pop(track_id, None)
+                    self._storage_track_ids.pop(track_id, None)
+                    self._samples.clear(track_id)
+            print(f"event=TRACK_ENDED track_id={lost_track.technical_track_id} at={now.isoformat()}", flush=True)
 
     def _expire_registration_proposals(self, now: datetime) -> None:
         """응답 기한을 넘긴 등록 제안을 만료 상태로 전환한다."""
@@ -597,6 +630,9 @@ class VisionApplication:
             self._registration_coordinator.discard(proposal_id)
         if expired_proposal_ids:
             print(f"registration_proposals_expired={len(expired_proposal_ids)}", flush=True)
+        purged_count = self._registration_service.purge_expired_unregistered_data(now)
+        if purged_count:
+            print(f"unregistered_data_purged={purged_count}", flush=True)
 
     @staticmethod
     def _log_events(events: List[TrackEvent]) -> None:
@@ -632,18 +668,21 @@ class VisionApplication:
                 self._draw_face(frame, overlay)
 
     def _person_overlay_label(self, track_id: int, sample_count: int) -> str:
-        """관찰 단계·외부인 등록 코드·식별 결과를 화면용 문구로 바꾼다."""
+        """관찰 단계·임시 인물 코드·식별 결과를 화면용 문구로 바꾼다."""
         with self._snapshot_lock:
             storage_track_id = self._storage_track_ids.get(track_id)
             registration_pending = track_id in self._registration_pending_tracks
             registration_code = self._registration_codes.get(track_id)
+            recovery_label = self._recovery_labels.get(track_id)
         observation_code = self._observation_code_for(track_id, storage_track_id)
+        if recovery_label is not None:
+            return f"{recovery_label}?"
         if registration_pending:
-            return f"외부인 | {registration_code}"
+            return f"임시 인물 | {registration_code}"
         if storage_track_id is not None:
             try:
-                if self._observation_service.current_status(storage_track_id) is CurrentIdentityStatus.EXTERNAL:
-                    return f"외부인 | {registration_code or observation_code}"
+                if self._observation_service.current_status(storage_track_id) is CurrentIdentityStatus.UNREGISTERED:
+                    return f"임시 인물 | {registration_code or observation_code}"
             except RuntimeError:
                 pass
             return f"표본 수집 중 | {observation_code}"
@@ -659,7 +698,7 @@ class VisionApplication:
     @staticmethod
     def _registration_code_for(proposal_id: str) -> str:
         """영속 RegistrationProposal ID에서 재사용되지 않는 화면·터미널용 코드를 만든다."""
-        return f"E-{proposal_id.replace('-', '')[:8].upper()}"
+        return f"U-{proposal_id.replace('-', '')[:8].upper()}"
 
     @staticmethod
     def _draw_face(frame: np.ndarray, overlay: _FaceOverlay) -> None:

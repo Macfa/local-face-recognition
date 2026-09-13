@@ -75,12 +75,12 @@ class TerminalRegistrationChannel:
     def _read_answer(self, display_code: str) -> str | None:
         """대소문자와 무관한 Y/N 값이 입력될 때까지 현재 요청만 기다린다.
 
-        Args: display_code: str. 운영자가 현재 요청을 구별할 외부인 코드.
+        Args: display_code: str. 운영자가 현재 요청을 구별할 임시 인물 코드.
         Returns: str | None. ``Y`` 또는 ``N``. stdin 종료·앱 종료면 ``None``.
         """
         while not self._stop_requested.is_set():
             try:
-                answer = input(f"외부인 {display_code}의 이름을 등록하시겠습니까? (Y/N): ").strip().casefold()
+                answer = input(f"임시 인물 {display_code}의 이름을 등록하시겠습니까? (Y/N): ").strip().casefold()
             except EOFError:
                 return None
             if answer in {"y", "n"}:
@@ -91,12 +91,12 @@ class TerminalRegistrationChannel:
     def _read_name(self, display_code: str) -> str | None:
         """공백이 아닌 이름이 입력될 때까지 같은 등록 요청을 유지한다.
 
-        Args: display_code: str. 운영자가 현재 요청을 구별할 외부인 코드.
+        Args: display_code: str. 운영자가 현재 요청을 구별할 임시 인물 코드.
         Returns: str | None. 정규화 전 이름 또는 취소 시 ``None``.
         """
         while not self._stop_requested.is_set():
             try:
-                name = input(f"외부인 {display_code}의 이름을 입력하세요: ").strip()
+                name = input(f"임시 인물 {display_code}의 이름을 입력하세요: ").strip()
             except EOFError:
                 return None
             if name:

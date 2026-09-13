@@ -8,7 +8,7 @@ from threading import Lock
 
 @dataclass(frozen=True)
 class RegistrationRequest:
-    """하나의 외부인 등록 제안을 채널에 전달할 때 필요한 식별 정보.
+    """하나의 임시 인물 등록 제안을 채널에 전달할 때 필요한 식별 정보.
 
     Attributes: proposal_id: str; display_code: str; track_id: int; storage_track_id: int.
     """
@@ -41,7 +41,7 @@ class RegistrationCoordinator:
         self._active: RegistrationRequest | None = None
 
     def enqueue(self, request: RegistrationRequest) -> None:
-        """외부인 판정 순서대로 중복 없는 요청을 대기열에 추가한다.
+        """임시 인물 전환 순서대로 중복 없는 요청을 대기열에 추가한다.
 
         Args: request: RegistrationRequest. proposal_id를 가진 신규 요청.
         Returns: None.
