@@ -28,9 +28,11 @@ from .components import (
 from .components.types import BBox, FaceCandidate, FaceQuality, TrackEvent, TrackedPerson
 from .domain import CurrentIdentityStatus, IdentityPolicy
 from .application_services.observation_service import ObservationService
+from .application_services.registration_coordinator import RegistrationCoordinator, RegistrationRequest
 from .application_services.registration_service import RegistrationService
 from .application_services.face_sample_service import FaceSampleService
 from .infrastructure.local_sqlite_repository import LocalSQLiteRepository
+from .infrastructure.terminal_registration_channel import TerminalRegistrationChannel
 
 
 _DISPLAY_FONT_PATHS = (
@@ -40,6 +42,18 @@ _DISPLAY_FONT_PATHS = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
 )
+
+
+def _log_operational_failure(stage: str, error: Exception) -> None:
+    """민감한 파일 경로나 SQL 내용을 노출하지 않고 작업 실패를 기록한다.
+
+    Args:
+        stage: str. 실패한 작업 경계의 고정된 식별자.
+        error: Exception. 내부 예외이며 유형만 로그에 기록한다.
+    Returns:
+        None.
+    """
+    print(f"operation_failed stage={stage} error_type={type(error).__name__}", flush=True)
 
 
 @lru_cache(maxsize=8)
@@ -118,15 +132,6 @@ class _TrackStorageRequest:
 
 
 @dataclass(frozen=True)
-class _RegistrationRequest:
-    """세 표본 저장을 마친 추적에 대해 이름 입력을 요청한다."""
-
-    track_id: int
-    storage_track_id: int
-    proposal_id: str
-
-
-@dataclass(frozen=True)
 class _LostTrack:
     """화면에서 사라진 뒤 종료 대기 중인 추적의 시각과 저장 키다."""
 
@@ -135,10 +140,18 @@ class _LostTrack:
 
 
 class VisionApplication:
-    """카메라 표시와 DB 비의존 분석 파이프라인을 조율한다."""
+    """카메라 표시, 비동기 분석, 도메인 서비스 호출을 연결하는 대표 오케스트레이터.
+
+    입력은 OpenCV 프레임과 등록 채널 응답이며, 출력은 화면 오버레이·SQLite 이력·등록 결과다.
+    검출·품질·신원·등록 규칙은 각각의 컴포넌트와 서비스에 위임한다.
+    """
 
     def __init__(self) -> None:
-        """로컬 모델 컴포넌트와 최신 프레임 분석 작업자를 준비한다."""
+        """운영 컴포넌트·서비스·작업 큐를 조합한다.
+
+        Args: 없음. 모델과 SQLite 위치는 로컬 실행 환경에서 계산한다.
+        Returns: None.
+        """
         root = _resource_root()
         self._detector = PersonDetector(root / "models" / "yolo11n.pt")
         self._tracker = IoUPersonTracker()
@@ -162,8 +175,9 @@ class VisionApplication:
         self._last_face_attempt_at: Dict[int, float] = {}
         self._analysis_queue: Queue[Tuple[np.ndarray, datetime]] = Queue(maxsize=1)
         self._storage_queue: Queue[object] = Queue()
-        self._registration_queue: Queue[_RegistrationRequest] = Queue()
         self._stop_requested = Event()
+        self._registration_coordinator = RegistrationCoordinator()
+        self._registration_channel = TerminalRegistrationChannel(self._stop_requested)
         self._snapshot_lock = Lock()
         self._track_end_delay_seconds = 10 * 60
         self._latest_people: List[Tuple[TrackedPerson, int]] = []
@@ -172,15 +186,21 @@ class VisionApplication:
         self._storage_track_ids: Dict[int, int] = {}
         self._registration_requested_tracks: Set[int] = set()
         self._registration_pending_tracks: Set[int] = set()
+        self._registration_codes: Dict[int, str] = {}
         self._registered_names: Dict[int, str] = {}
         self._lost_tracks: Dict[int, _LostTrack] = {}
         self._pending_storage_by_track: Dict[int, int] = {}
     def run(self) -> None:
-        """카메라 표시 루프와 별도 분석 작업자를 시작하고 종료를 정리한다."""
+        """카메라 표시 루프와 책임별 작업자를 시작하고 종료를 정리한다.
+
+        Returns: None.
+        Raises: RuntimeError. 카메라를 열거나 프레임을 읽지 못하면 발생.
+        """
         camera = cv2.VideoCapture(0)
         if not camera.isOpened():
             raise RuntimeError("Camera 0 could not be opened.")
 
+        # 화면 루프와 무거운 분석·저장·등록 입력을 분리해 카메라 프레임을 보호한다.
         worker = Thread(target=self._run_analysis_worker, name="analysis-worker", daemon=True)
         storage_worker = Thread(target=self._run_storage_worker, name="storage-worker", daemon=True)
         registration_worker = Thread(
@@ -206,12 +226,14 @@ class VisionApplication:
                 ok, frame = camera.read()
                 if not ok:
                     raise RuntimeError("A camera frame could not be read.")
+                # 1. 최신 프레임만 분석으로 넘기고, 이전 분석 결과를 즉시 화면에 투영한다.
                 self._submit_latest_frame(frame, datetime.now(timezone.utc))
                 self._draw_latest_annotations(frame)
                 cv2.imshow("Camera Vision - q to stop", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
         finally:
+            # 2. 새 작업을 중단한 뒤 작업자·카메라·창을 순서대로 정리한다.
             self._stop_requested.set()
             worker.join(timeout=3)
             storage_worker.join(timeout=3)
@@ -237,13 +259,18 @@ class VisionApplication:
                 pass
 
     def _run_analysis_worker(self) -> None:
-        """사람 추적부터 얼굴 표본 판정까지를 화면 루프와 분리해 실행한다."""
+        """최신 프레임에서 사람 추적과 얼굴 후보·품질·임베딩 생성을 수행한다.
+
+        입력: Queue[Tuple[np.ndarray, datetime]]. 출력: 화면 스냅샷과 표본 저장 요청.
+        SQLite 접근과 신원 누적 판단은 수행하지 않는다. Returns: None.
+        """
         while not self._stop_requested.is_set():
             try:
                 frame, occurred_at = self._analysis_queue.get(timeout=0.2)
             except Empty:
                 continue
             try:
+                # 1. 사람 검출을 Track으로 연결하고 확정·상실 이벤트를 만든다.
                 people, events = self._tracker.update(self._detector.detect(frame), occurred_at)
                 self._log_events(events)
                 for event in events:
@@ -251,8 +278,9 @@ class VisionApplication:
                         _TrackStorageRequest(event, self._storage_track_id_for(event.internal_id))
                     )
                     if event.kind == "TRACK_LOST":
-                        self._analysis_faces.pop(event.internal_id, None)
+                        self._clear_active_track_projection(event.internal_id)
                         self._mark_track_lost(event)
+                # 2. 확정 대상별 얼굴 분석과 중복 차단을 수행하고 통과 표본만 저장으로 넘긴다.
                 for person in people:
                     overlay = self._analyze_face_if_due(frame, person, occurred_at)
                     if overlay is not None:
@@ -262,10 +290,14 @@ class VisionApplication:
                     self._latest_people = snapshot
                     self._latest_faces = dict(self._analysis_faces)
             except Exception as error:
-                print(f"analysis_worker_error={type(error).__name__} message={error}", flush=True)
+                _log_operational_failure("analysis_worker", error)
 
     def _run_storage_worker(self) -> None:
-        """로컬 저장소와 private crop 파일 저장을 화면·분석 작업과 분리해 처리한다."""
+        """Track 전이와 FaceSample 저장·DB 신원 판단을 SQLite 작업자로 수행한다.
+
+        입력: _TrackStorageRequest | _FaceSampleStorageRequest. 출력: DB 이력·신원 결과·등록 제안.
+        Returns: None.
+        """
         while not self._stop_requested.is_set() or not self._storage_queue.empty():
             try:
                 item = self._storage_queue.get(timeout=0.2)
@@ -273,6 +305,7 @@ class VisionApplication:
                 continue
             try:
                 if isinstance(item, _TrackStorageRequest):
+                    # 1. 기술 Track 이벤트를 도메인 Track·관찰 세션 전이로 저장한다.
                     if item.event.kind == "TRACK_CONFIRMED":
                         self._observation_service.start(item.storage_track_id, item.event.occurred_at)
                     elif item.event.kind == "TRACK_LOST":
@@ -282,18 +315,20 @@ class VisionApplication:
                         flush=True,
                     )
                 elif isinstance(item, _FaceSampleStorageRequest):
+                    # 2. 표본을 저장하고 템플릿 검색과 누적 신원 정책을 적용한다.
                     result = self._face_sample_service.process(item.storage_track_id, item.candidate, item.quality, item.embedding, item.face_crop)
                     if result.status == "FAILED":
-                        print(f"face_sample_error={result.error}", flush=True)
+                        print("face_sample_error=processing_failed", flush=True)
                     elif result.status == "DISCARDED":
                         print(f"face_sample=discarded_final_identity track_id={item.candidate.track_id}", flush=True)
                     else:
                         self._apply_identity(item.candidate.track_id, result.status, result.person_name)
                         print(f"identity_result=applied track_id={item.candidate.track_id} status={result.status}", flush=True)
                         if result.proposal_id is not None:
+                            # 3. 외부인 등록 제안은 FIFO 등록 조율기로 넘긴다.
                             self._request_registration(item.candidate.track_id, item.storage_track_id, result.proposal_id)
             except Exception as error:
-                print(f"storage_error={type(error).__name__} message={error}", flush=True)
+                _log_operational_failure("storage_worker", error)
             finally:
                 if isinstance(item, _FaceSampleStorageRequest):
                     self._complete_storage_work(item.candidate.track_id)
@@ -309,43 +344,44 @@ class VisionApplication:
         self._expire_registration_proposals(now)
 
     def _run_registration_worker(self) -> None:
-        """외부인 등록 제안에 대해 Terminal 확인·이름 입력과 프로필 등록을 처리한다."""
-        while not self._stop_requested.is_set() or not self._registration_queue.empty():
-            try:
-                request = self._registration_queue.get(timeout=0.2)
-            except Empty:
+        """FIFO 활성 요청 하나를 채널에 제시하고 proposal_id 기반 응답을 반영한다.
+
+        입력: RegistrationCoordinator의 요청과 RegistrationChannel 응답. 출력: 등록·거절 전이와
+        화면 이름 투영. Returns: None.
+        """
+        while not self._stop_requested.is_set():
+            request = self._registration_coordinator.activate_next()
+            if request is not None:
+                # 1. 현재 활성 요청만 채널에 보낸다. 뒤 요청은 FIFO 대기한다.
+                self._registration_channel.present(request)
+            response = self._registration_channel.next_response(timeout_seconds=0.2)
+            if response is None:
+                continue
+            request = self._registration_coordinator.active_request()
+            if request is None or response.proposal_id != request.proposal_id:
+                print("registration_response_discarded reason=unexpected_proposal", flush=True)
                 continue
             try:
-                print(
-                    f"external_identity_confirmed track_id={request.track_id} "
-                    "registration_name_required=true",
-                    flush=True,
-                )
-                answer = self._read_registration_answer(request.track_id)
-                if answer is None:
+                # 2. 응답 proposal_id가 활성 요청과 일치할 때만 도메인 등록을 수행한다.
+                if response.status == "CANCELLED":
                     self._clear_registration_pending(request.track_id)
                     print(f"registration_cancelled track_id={request.track_id} reason=stdin_closed", flush=True)
                     continue
-                if answer == "N":
+                if response.status == "REJECTED":
                     outcome = self._registration_service.respond(
                         request.proposal_id,
                         "",
                         datetime.now(timezone.utc),
                     )
                     if outcome.status == "FAILED":
-                        print(f"registration_error=RegistrationFailed message={outcome.error}", flush=True)
+                        print("registration_error=RegistrationFailed", flush=True)
                         continue
                     self._clear_registration_pending(request.track_id)
                     print(f"registration_cancelled track_id={request.track_id}", flush=True)
                     continue
-                name = self._read_registration_name(request.track_id)
-                if name is None:
-                    self._clear_registration_pending(request.track_id)
-                    print(f"registration_cancelled track_id={request.track_id} reason=stdin_closed", flush=True)
-                    continue
                 outcome = self._registration_service.respond(
                     request.proposal_id,
-                    name,
+                    response.name or "",
                     datetime.now(timezone.utc),
                 )
                 if outcome.status == "REJECTED":
@@ -353,12 +389,12 @@ class VisionApplication:
                     print(f"registration_cancelled track_id={request.track_id}", flush=True)
                     continue
                 if outcome.status == "FAILED":
-                    print(f"registration_error=RegistrationFailed message={outcome.error}", flush=True)
+                    print("registration_error=RegistrationFailed", flush=True)
                     continue
                 self._apply_identity(request.track_id, "IDENTIFIED", outcome.name)
                 self._clear_registration_pending(request.track_id)
                 print(
-                    f"person_profile=registered track_id={request.track_id} "
+                    f"person_profile=registered track_id={request.track_id} registration_code={request.display_code} "
                     f"name={outcome.name} template_count=3",
                     flush=True,
                 )
@@ -369,7 +405,10 @@ class VisionApplication:
             except EOFError:
                 print(f"registration_cancelled track_id={request.track_id} reason=stdin_closed", flush=True)
             except Exception as error:
-                print(f"registration_channel_error={type(error).__name__} message={error}", flush=True)
+                _log_operational_failure("registration_channel", error)
+            finally:
+                self._registration_coordinator.complete(request.proposal_id)
+        self._registration_channel.close()
 
     def _analyze_face_if_due(
         self,
@@ -449,39 +488,17 @@ class VisionApplication:
         return overlay
 
     def _request_registration(self, track_id: int, storage_track_id: int, proposal_id: str) -> None:
-        """한 Track에서 이름 입력 요청을 한 번만 대기열에 넣는다."""
+        """한 외부인 Track에 불변 등록 코드를 붙여 이름 입력을 한 번만 요청한다."""
+        display_code = self._registration_code_for(proposal_id)
         with self._snapshot_lock:
             if track_id in self._registration_requested_tracks:
                 return
             self._registration_requested_tracks.add(track_id)
             self._registration_pending_tracks.add(track_id)
-        self._registration_queue.put(_RegistrationRequest(track_id, storage_track_id, proposal_id))
-
-    def _read_registration_answer(self, track_id: int) -> str | None:
-        """대소문자와 무관하게 유효한 등록 여부 응답이 올 때까지 다시 묻는다."""
-        while not self._stop_requested.is_set():
-            try:
-                answer = input(
-                    f"외부인으로 확인되었습니다. Track {track_id}의 이름을 등록하시겠습니까? (Y/N): "
-                ).strip().casefold()
-            except EOFError:
-                return None
-            if answer in {"y", "n"}:
-                return answer.upper()
-            print("등록 입력이 올바르지 않습니다. Y 또는 N을 입력하세요.", flush=True)
-        return None
-
-    def _read_registration_name(self, track_id: int) -> str | None:
-        """공백이 아닌 이름이 입력될 때까지 등록 대상의 이름을 다시 묻는다."""
-        while not self._stop_requested.is_set():
-            try:
-                name = input(f"Track {track_id}의 이름을 입력하세요: ").strip()
-            except EOFError:
-                return None
-            if name:
-                return name
-            print("이름을 비워둘 수 없습니다. 다시 입력하세요.", flush=True)
-        return None
+            self._registration_codes[track_id] = display_code
+        self._registration_coordinator.enqueue(
+            RegistrationRequest(proposal_id, display_code, track_id, storage_track_id)
+        )
 
     def _clear_registration_pending(self, track_id: int) -> None:
         """등록 질문이 끝난 Track의 화면 대기 상태를 해제한다."""
@@ -515,12 +532,21 @@ class VisionApplication:
             return storage_track_id
 
     def _mark_track_lost(self, event: TrackEvent) -> None:
-        """TRACK_LOST를 화면 제거와 10분 종료 대기 상태로 전환한다."""
+        """TRACK_LOST를 과거 세션의 10분 종료 대기 상태로 전환한다."""
         with self._snapshot_lock:
             self._lost_tracks[event.internal_id] = _LostTrack(
                 self._storage_track_ids[event.internal_id],
                 event.occurred_at,
             )
+
+    def _clear_active_track_projection(self, track_id: int) -> None:
+        """상실된 기술 Track의 화면 이름·등록 대기·얼굴 오버레이를 즉시 폐기한다."""
+        with self._snapshot_lock:
+            self._analysis_faces.pop(track_id, None)
+            self._latest_faces.pop(track_id, None)
+            self._latest_people = [item for item in self._latest_people if item[0].internal_id != track_id]
+            self._registered_names.pop(track_id, None)
+            self._registration_pending_tracks.discard(track_id)
 
     def _start_storage_work(self, track_id: int) -> None:
         """종료 전에 마쳐야 하는 FaceSample 저장 작업 수를 증가시킨다."""
@@ -549,7 +575,7 @@ class VisionApplication:
             try:
                 ended = self._observation_service.end_if_possible(lost_track.storage_track_id, now)
             except Exception as error:
-                print(f"track_end_error={type(error).__name__} message={error}", flush=True)
+                _log_operational_failure("track_end", error)
                 continue
             if not ended:
                 continue
@@ -557,15 +583,20 @@ class VisionApplication:
                 self._lost_tracks.pop(track_id, None)
                 self._last_face_attempt_at.pop(track_id, None)
                 self._registration_pending_tracks.discard(track_id)
+                self._registration_requested_tracks.discard(track_id)
+                self._registration_codes.pop(track_id, None)
                 self._registered_names.pop(track_id, None)
+                self._storage_track_ids.pop(track_id, None)
             self._samples.clear(track_id)
             print(f"event=TRACK_ENDED track_id={track_id} at={now.isoformat()}", flush=True)
 
     def _expire_registration_proposals(self, now: datetime) -> None:
         """응답 기한을 넘긴 등록 제안을 만료 상태로 전환한다."""
-        expired_count = self._registration_service.expire_pending(now)
-        if expired_count:
-            print(f"registration_proposals_expired={expired_count}", flush=True)
+        expired_proposal_ids = self._registration_service.expire_pending(now)
+        for proposal_id in expired_proposal_ids:
+            self._registration_coordinator.discard(proposal_id)
+        if expired_proposal_ids:
+            print(f"registration_proposals_expired={len(expired_proposal_ids)}", flush=True)
 
     @staticmethod
     def _log_events(events: List[TrackEvent]) -> None:
@@ -588,7 +619,7 @@ class VisionApplication:
             _draw_display_label(
                 frame,
                 (
-                    f"{registered_names[person.internal_id]} | samples {sample_count}"
+                    registered_names[person.internal_id]
                     if person.internal_id in registered_names
                     else self._person_overlay_label(person.internal_id, sample_count)
                 ),
@@ -601,19 +632,34 @@ class VisionApplication:
                 self._draw_face(frame, overlay)
 
     def _person_overlay_label(self, track_id: int, sample_count: int) -> str:
-        """도메인 세션의 현재 신원 결과를 화면용 짧은 문구로 바꾼다."""
+        """관찰 단계·외부인 등록 코드·식별 결과를 화면용 문구로 바꾼다."""
         with self._snapshot_lock:
             storage_track_id = self._storage_track_ids.get(track_id)
             registration_pending = track_id in self._registration_pending_tracks
+            registration_code = self._registration_codes.get(track_id)
+        observation_code = self._observation_code_for(track_id, storage_track_id)
         if registration_pending:
-            return f"등록대기 | samples {sample_count}"
+            return f"외부인 | {registration_code}"
         if storage_track_id is not None:
             try:
                 if self._observation_service.current_status(storage_track_id) is CurrentIdentityStatus.EXTERNAL:
-                    return f"External | samples {sample_count}"
+                    return f"외부인 | {registration_code or observation_code}"
             except RuntimeError:
                 pass
-        return f"Track {track_id} | samples {sample_count}"
+            return f"표본 수집 중 | {observation_code}"
+        return "추적 확인 중"
+
+    @staticmethod
+    def _observation_code_for(track_id: int, storage_track_id: int | None) -> str:
+        """현재 관찰 세션을 화면에서만 구별할 짧은 임시 코드를 만든다."""
+        if storage_track_id is None:
+            return f"T-{track_id:04X}"
+        return f"T-{storage_track_id & 0xFFFFFFFF:08X}"
+
+    @staticmethod
+    def _registration_code_for(proposal_id: str) -> str:
+        """영속 RegistrationProposal ID에서 재사용되지 않는 화면·터미널용 코드를 만든다."""
+        return f"E-{proposal_id.replace('-', '')[:8].upper()}"
 
     @staticmethod
     def _draw_face(frame: np.ndarray, overlay: _FaceOverlay) -> None:

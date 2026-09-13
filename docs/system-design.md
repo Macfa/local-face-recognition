@@ -59,9 +59,10 @@ Application은 신원 판단 규칙이나 AI 알고리즘을 직접 갖지 않�
 기술에 직접 의존하지 않는다.
 
 사람 추적기는 검출 결과를 내부 ID로 연결한다. 같은 내부 ID가 연속 확인 프레임 수를
-채우면 `TRACK_CONFIRMED`, 상실 허용 구간을 넘겨 내부 ID가 종료되면 `TRACK_LOST`를
-Application에 전달한다. 초기 확인 프레임 수는 3이며, 두 기준은 런타임 설정값이다.
-Domain에는 이 확정·상실 이벤트만 전달하고 내부 ID·bounding box·프레임 카운터는 저장하지
+채우면 `TRACK_CONFIRMED`, 마지막 검출 뒤 상실 허용 시간(초)을 넘기면 내부 ID를 폐기하고
+`TRACK_LOST`를 Application에 전달한다. 초기 확인 프레임 수는 3, 상실 허용 시간은 1초이며,
+두 기준은 런타임 설정값이다. `TRACK_LOST` 이후 재등장한 사람은 기존 내부 ID를 복구하지 않고
+새 내부 ID·새 PersonTrack·새 ObservationSession으로 시작한다. Domain에는 이 확정·상실 이벤트만 전달하고 내부 ID·bounding box·프레임 카운터는 저장하지
 않는다.
 
 ## 실시간 실행 구조
@@ -88,10 +89,15 @@ sequenceDiagram
 
 | 책임 | 현재 기술 |
 | --- | --- |
-| 구현 언어 | Python 3.9 이상 |
+| 구현 언어 | Python 3.9~3.12 |
 | 카메라·영상 표시 | OpenCV |
 | 사람 검출 | Ultralytics YOLO, 로컬 가중치 |
 | 사람 추적 | IoU 기반 추적기 |
+
+등록 확인은 Application 계층의 `RegistrationCoordinator`가 관리한다. 채널은
+`RegistrationChannel` 포트로 분리하며, 현재 로컬 운영은 `TerminalRegistrationChannel`만
+사용한다. Telegram은 사진과 응답을 외부로 전송하므로 기본 운영 채널이 아니며, 별도 보안
+승인 후 같은 포트를 구현하는 어댑터로만 추가한다.
 | 얼굴 검출·임베딩 | InsightFace, ONNX Runtime CPU |
 | 얼굴 품질 | OpenCV 촬영 품질 지표 + 로컬 ONNX 가림 분류기 |
 | 기준 DB·벡터 검색 | 자체 운영 PostgreSQL + pgvector |
@@ -357,6 +363,6 @@ IdentityDecision 이력이 프로필을 참조할 수 있으므로, 삭제 API�
 - 영상 출력과 AI 분석은 논리적으로 분리한다.
 - Domain은 외부 기술 구현을 직접 참조하지 않는다.
 - 기술 Component는 Domain 의미나 최종 신원 판단을 소유하지 않는다.
-- 모델 가중치는 실행 시 자동 다운로드하지 않고 로컬 파일을 사용한다.
+- `run.py`는 최초 실행 시 모델 가중치를 원본 배포처에서 내려받고, 이후 로컬 파일만 사용한다.
 - 카메라 원본 프레임은 영속 저장하지 않는다.
 - 품질과 비중복 기준을 통과한 얼굴 crop과 임베딩만 관찰 이력으로 영속 저장한다.

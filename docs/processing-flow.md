@@ -32,12 +32,24 @@ flowchart TD
 | 새 `TRACK_CONFIRMED` | `PersonTrack` 생성 | 새 `ObservationSession` 생성 |
 | 이미 연결된 내부 ID의 확인 결과 | 기존 Track 갱신 | 기존 세션 유지 |
 | `TRACK_LOST` | 화면 표시 제거, 이미 시작한 분석·저장 작업 마무리 | 유지 |
+
+화면에서 확정 Track은 `표본 수집 중 | T-XXXXXXXX`으로 표시한다. `T-` 코드는 현재 관찰
+세션을 구별하는 임시 코드다. 외부인 판정이 나면 `외부인 | E-XXXXXXXX`으로 바뀐다. `E-`
+코드는 `RegistrationProposal` ID에서 만든 불변 등록 요청 코드이며, 화면과 터미널의 이름
+입력 요청은 같은 코드를 사용한다. 등록 인물은 기본적으로 이름만 표시한다.
+
+`RegistrationCoordinator`는 외부인 판정 완료 순서(FIFO)로 요청을 관리하고, 등록 채널에는
+한 번에 하나의 활성 요청만 전달한다. 현재 요청의 Y/N과 이름 입력이 완료돼야 다음 요청을
+묻는다. Telegram은 같은 `RegistrationChannel` 포트를 구현하는 추가 어댑터이며, 도메인 등록
+규칙과 FIFO 순서는 바꾸지 않는다.
 | LOST 후 10분 경과 + 진행 작업 완료 | Track 종료 | 세션 종료 |
 
 추적 컴포넌트는 같은 내부 ID가 연속 확인 프레임 수를 채워야 `TRACK_CONFIRMED`를 낸다.
-초기 확인 프레임 수는 3이다. 일시 가림은 추적기의 상실 허용 구간 안에서만 처리하며, 그
-구간을 넘겨 내부 ID를 종료할 때 `TRACK_LOST`를 낸다. 두 값은 카메라 환경별 설정값이고
-PersonTrack이나 ObservationSession에 저장하지 않는다.
+초기 확인 프레임 수는 3이다. 마지막 검출 뒤 1초 동안 다시 확인되지 않으면 내부 ID를
+폐기하고 `TRACK_LOST`를 낸다. 이 시간은 분석 작업자 처리량과 무관한 실제 경과 시간 기준이다.
+`TRACK_LOST` 순간 화면의 이름·등록대기·얼굴 오버레이는 즉시 제거한다. 이후 재등장자는 기존
+내부 ID나 ObservationSession을 복구하지 않고 새 Track으로 확인 과정을 다시 시작한다.
+10분 보관은 과거 LOST Track의 DB 이력 종료를 위한 시간이며 화면 신원 유지·복구에는 사용하지 않는다.
 
 ## 신원 상태 흐름
 
