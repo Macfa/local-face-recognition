@@ -17,10 +17,15 @@ from .types import FaceCandidate, FaceQuality, MemoryFaceSample, TrackedPerson
 
 
 class FaceAnalyzer:
-    """확정된 사람 영역에서 가장 큰 얼굴과 랜드마크를 찾는다."""
+    """확정 사람 영역에서 가장 큰 얼굴·랜드마크·자세를 추출하는 로컬 InsightFace 컴포넌트."""
 
     def __init__(self, model_root: Path) -> None:
-        """로컬 InsightFace 얼굴 검출 모델을 CPU 실행으로 준비한다."""
+        """CPU 얼굴 검출 모델을 연다.
+
+        Args: model_root: Path. `models/buffalo_l`을 포함한 로컬 모델 루트.
+        Returns: None.
+        Raises: FileNotFoundError. 모델 디렉터리가 없으면 발생.
+        """
         model_directory = model_root / "models" / "buffalo_l"
         if not model_directory.is_dir():
             raise FileNotFoundError(f"InsightFace model directory is missing: {model_directory}")
@@ -38,7 +43,11 @@ class FaceAnalyzer:
         person: TrackedPerson,
         captured_at: datetime,
     ) -> FaceCandidate | None:
-        """사람 영역의 가장 큰 얼굴을 품질 평가 전 후보로 반환한다."""
+        """사람 BBox 안의 가장 큰 얼굴을 FaceCandidate로 반환한다.
+
+        Args: frame: np.ndarray BGR 프레임; person: TrackedPerson 대상; captured_at: datetime 관측 시각.
+        Returns: FaceCandidate | None. 얼굴·랜드마크·자세 또는 미검출 None.
+        """
         frame_height, frame_width = frame.shape[:2]
         left, top, right, bottom = self._clip_bbox(person.bbox, frame_width, frame_height)
         person_crop = frame[top:bottom, left:right]
@@ -82,13 +91,21 @@ class FaceAnalyzer:
         width: int,
         height: int,
     ) -> Tuple[int, int, int, int]:
-        """경계 상자가 프레임 밖으로 나가지 않도록 잘라낸다."""
+        """BBox를 프레임 폭·높이 안으로 자른다.
+
+        Args: bbox: Tuple[int, int, int, int]; width: int; height: int.
+        Returns: Tuple[int, int, int, int]. 유효 범위로 제한된 BBox.
+        """
         left, top, right, bottom = bbox
         return max(0, left), max(0, top), min(width, right), min(height, bottom)
 
     @staticmethod
     def _yaw_proxy(points: np.ndarray) -> float:
-        """등록 표본 방향 다양성에 쓰는 랜드마크 기반 좌우 방향 근사값을 계산한다."""
+        """5점 랜드마크에서 방향 다양성용 좌우 근사값을 계산한다.
+
+        Args: points: np.ndarray. shape (5, 2) 얼굴 랜드마크.
+        Returns: float. 눈 간 거리로 정규화한 코 중심 오프셋.
+        """
         eye_distance = float(np.linalg.norm(points[1] - points[0]))
         if eye_distance == 0:
             return 0.0
@@ -96,10 +113,15 @@ class FaceAnalyzer:
         return float((points[2][0] - eye_midpoint_x) / eye_distance)
 
 class FaceEmbeddingComponent:
-    """품질을 통과한 얼굴 후보를 로컬 ArcFace 임베딩으로 변환한다."""
+    """품질 통과 얼굴 crop을 로컬 ArcFace 임베딩으로 변환하는 컴포넌트."""
 
     def __init__(self, model_root: Path) -> None:
-        """자동 다운로드 없이 배치된 recognition ONNX 가중치를 연다."""
+        """로컬 recognition ONNX 모델을 연다.
+
+        Args: model_root: Path. `w600k_r50.onnx`를 포함한 모델 루트.
+        Returns: None.
+        Raises: FileNotFoundError. 가중치가 없으면 발생.
+        """
         model_path = model_root / "models" / "buffalo_l" / "w600k_r50.onnx"
         if not model_path.is_file():
             raise FileNotFoundError(f"Face recognition model is missing: {model_path}")
@@ -107,7 +129,12 @@ class FaceEmbeddingComponent:
         self._model.prepare(ctx_id=0)
 
     def embed(self, frame: np.ndarray, candidate: FaceCandidate) -> np.ndarray:
-        """후보의 얼굴 영역을 정렬해 L2 정규화된 임베딩으로 반환한다."""
+        """얼굴을 랜드마크 정렬하고 L2 정규화된 벡터를 반환한다.
+
+        Args: frame: np.ndarray BGR 프레임; candidate: FaceCandidate 얼굴 영역과 랜드마크.
+        Returns: np.ndarray. shape (N,)의 정규화 얼굴 임베딩.
+        Raises: ValueError. crop이 비었거나 벡터 norm이 0이면 발생.
+        """
         left, top, right, bottom = candidate.bbox
         crop = frame[top:bottom, left:right]
         if not crop.size:
@@ -126,17 +153,26 @@ class FaceEmbeddingComponent:
 
 
 class FaceOcclusionEvaluator:
-    """로컬 ONNX 분류기로 얼굴 가림 확률을 계산한다."""
+    """로컬 ONNX 분류기로 얼굴 crop의 가림 확률을 계산하는 컴포넌트."""
 
     def __init__(self, model_path: Path) -> None:
-        """얼굴 가림 모델과 입력 이름을 준비한다."""
+        """가림 분류 ONNX 모델을 연다.
+
+        Args: model_path: Path. 로컬 가림 분류 모델 파일.
+        Returns: None.
+        Raises: FileNotFoundError. 모델 파일이 없으면 발생.
+        """
         if not model_path.is_file():
             raise FileNotFoundError(f"Face occlusion model is missing: {model_path}")
         self._session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
         self._input_name = self._session.get_inputs()[0].name
 
     def occlusion_probability(self, crop: np.ndarray) -> float:
-        """얼굴 crop이 가려졌을 확률을 반환한다."""
+        """BGR 얼굴 crop의 가림 클래스 확률을 반환한다.
+
+        Args: crop: np.ndarray. BGR 얼굴 crop.
+        Returns: float. 0.0~1.0 가림 확률.
+        """
         resized = cv2.resize(crop, (224, 224))
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         normalized = (rgb - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
@@ -147,7 +183,7 @@ class FaceOcclusionEvaluator:
 
 
 class FaceQualityEvaluator:
-    """품질·자세·가림 기준을 적용해 FaceCandidate의 표본 적합도를 평가한다."""
+    """크기·선명도·밝기·가림·자세 기준으로 FaceCandidate 표본 적합도를 평가한다."""
 
     def __init__(
         self,
@@ -162,7 +198,11 @@ class FaceQualityEvaluator:
         maximum_occlusion_probability: float = 0.5,
         enforce_pose_limits: bool = True,
     ) -> None:
-        """표본 저장 전에 적용할 초기 품질 정책 값을 설정한다."""
+        """FaceSample 채택에 사용할 품질 정책 값을 설정한다.
+
+        Args: occlusion_evaluator: FaceOcclusionEvaluator; 나머지 float/int 인자는 각 품질 하한·상한.
+        Returns: None.
+        """
         self._occlusion_evaluator = occlusion_evaluator
         self._minimum_face_size = minimum_face_size
         self._minimum_sharpness = minimum_sharpness
@@ -175,7 +215,11 @@ class FaceQualityEvaluator:
         self._enforce_pose_limits = enforce_pose_limits
 
     def evaluate(self, frame: np.ndarray, candidate: FaceCandidate) -> FaceQuality:
-        """후보의 촬영 상태가 영속 FaceSample을 만들기에 충분한지 판단한다."""
+        """한 얼굴 후보의 표본 저장 적합도를 평가한다.
+
+        Args: frame: np.ndarray BGR 프레임; candidate: FaceCandidate.
+        Returns: FaceQuality. 통과 여부·점수·수치·거부 사유.
+        """
         left, top, right, bottom = candidate.bbox
         crop = frame[top:bottom, left:right]
         if not crop.size:
@@ -214,7 +258,7 @@ class FaceQualityEvaluator:
 
 
 class InMemoryFaceSampleStore:
-    """한 Track 안에서 거의 같은 표본이 반복 저장되는 것을 막는다."""
+    """한 런타임 Track 안에서 임베딩·자세가 유사한 표본의 반복 저장을 막는 메모리 저장소."""
 
     def __init__(
         self,
@@ -223,7 +267,11 @@ class InMemoryFaceSampleStore:
         maximum_pitch_difference_degrees: float = 15.0,
         maximum_roll_difference_degrees: float = 15.0,
     ) -> None:
-        """임베딩 기록과 같은 자세 표본의 차단 기준을 설정한다."""
+        """중복 임베딩·유사 자세 차단 기준을 설정한다.
+
+        Args: duplicate_similarity: float; maximum_*_difference_degrees: float 자세 차이 허용값.
+        Returns: None.
+        """
         self._duplicate_similarity = duplicate_similarity
         self._maximum_yaw_difference_degrees = maximum_yaw_difference_degrees
         self._maximum_pitch_difference_degrees = maximum_pitch_difference_degrees
@@ -236,7 +284,11 @@ class InMemoryFaceSampleStore:
         embedding: np.ndarray,
         quality: FaceQuality,
     ) -> Tuple[bool, float | None, str | None]:
-        """표본이 새로울 때만 저장하고, 거부 시 근거 유사도와 사유를 반환한다."""
+        """새 표본만 Track 메모리에 추가하고 중복 결과를 반환한다.
+
+        Args: candidate: FaceCandidate; embedding: np.ndarray; quality: FaceQuality.
+        Returns: Tuple[bool, float | None, str | None]. 저장 여부, 최대 유사도, 거부 사유.
+        """
         samples = self._samples.setdefault(candidate.track_id, [])
         vector = embedding / np.linalg.norm(embedding)
         similarities = [float(np.dot(vector, sample.embedding)) for sample in samples]
@@ -259,15 +311,27 @@ class InMemoryFaceSampleStore:
         return True, maximum_similarity, None
 
     def count(self, track_id: int) -> int:
-        """현재 Track에서 영속화 대상으로 채택한 표본 수를 반환한다."""
+        """현재 Track에서 채택한 메모리 표본 수를 반환한다.
+
+        Args: track_id: int. 런타임 Track ID.
+        Returns: int. 채택 표본 수.
+        """
         return len(self._samples.get(track_id, []))
 
     def clear(self, track_id: int) -> None:
-        """종료된 Track의 런타임 중복 판정 상태를 폐기한다."""
+        """종료된 Track의 중복 판정 메모리를 폐기한다.
+
+        Args: track_id: int. 런타임 Track ID.
+        Returns: None.
+        """
         self._samples.pop(track_id, None)
 
     def _has_similar_pose(self, candidate: FaceCandidate, sample: MemoryFaceSample) -> bool:
-        """새 후보와 기존 표본의 yaw·pitch·roll 차이가 모두 허용 범위 안인지 확인한다."""
+        """새 후보와 기존 표본의 세 자세 차이가 모두 허용 범위인지 반환한다.
+
+        Args: candidate: FaceCandidate; sample: MemoryFaceSample.
+        Returns: bool. yaw·pitch·roll 모두 유사하면 True.
+        """
         return (
             abs(candidate.yaw_degrees - sample.yaw_degrees) <= self._maximum_yaw_difference_degrees
             and abs(candidate.pitch_degrees - sample.pitch_degrees) <= self._maximum_pitch_difference_degrees
