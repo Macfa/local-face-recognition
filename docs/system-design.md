@@ -54,6 +54,12 @@ Application은 신원 판단 규칙이나 AI 알고리즘을 직접 갖지 않�
 제공한다. Component는 "무엇을 감지·계산했는가"를 반환하며,
 "누구인가"를 판단하지 않는다.
 
+얼굴 분석은 사람 Track마다 독립적으로 "가장 큰 얼굴"을 찾지 않는다. 한 분석 프레임에서
+얼굴을 한 번 검출한 뒤, 얼굴 상자가 사람 상자 안에 충분히 포함되고 상단 영역에 위치한 경우만
+후보로 삼아 사람 Track과 얼굴을 일대일로 배정한다. 한 얼굴은 최대 하나의 Track에만 귀속된다.
+하나의 얼굴이 둘 이상의 사람 상자에 거의 같은 점수로 포함되면 귀속 자체를 보류하며, 해당
+프레임은 FaceSample·임베딩·신원 판단에 사용하지 않는다.
+
 `infrastructure/`에는 로컬 SQLite 또는 PostgreSQL·pgvector·MinIO Repository처럼
 실제 저장 기술과 연결되는 구현을 둔다. Domain은 이 구체
 기술에 직접 의존하지 않는다.
@@ -125,6 +131,12 @@ sequenceDiagram
 `RegistrationChannel` 포트로 분리하며, 현재 로컬 운영은 `TerminalRegistrationChannel`만
 사용한다. Telegram은 사진과 응답을 외부로 전송하므로 기본 운영 채널이 아니며, 별도 보안
 승인 후 같은 포트를 구현하는 어댑터로만 추가한다.
+
+Terminal 채널은 운영자 입력을 기다리는 동안 고빈도 얼굴 분석 로그를 콘솔이 아닌 실행 PC의
+`operational.log`에 기록한다. 이에 따라 현재 활성 등록 질문이 새 분석 로그에 밀려 보이지
+않는다. Telegram 어댑터는 `RegistrationChannel` 포트로 추가할 수 있으나, Bot API를 사용하면
+임시 코드·운영자 응답·이름이 Telegram 서비스로 전송된다. 얼굴 이미지와 임베딩은 보내지 않는
+것을 기본 규칙으로 하며, 토큰·운영자 Chat ID·외부 전송 승인 없이는 활성화하지 않는다.
 | 얼굴 검출·임베딩 | InsightFace, ONNX Runtime CPU |
 | 얼굴 품질 | OpenCV 촬영 품질 지표 + 로컬 ONNX 가림 분류기 |
 | 기준 DB·벡터 검색 | 자체 운영 PostgreSQL + pgvector |

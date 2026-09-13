@@ -19,6 +19,7 @@ class TerminalRegistrationChannel:
         """
         self._stop_requested = stop_requested
         self._responses: Queue[RegistrationResponse] = Queue()
+        self._prompt_active = Event()
 
     def present(self, request: RegistrationRequest) -> None:
         """활성 RegistrationRequest 하나를 별도 입력 작업에서 질문한다.
@@ -39,6 +40,10 @@ class TerminalRegistrationChannel:
         except Empty:
             return None
 
+    def is_prompt_active(self) -> bool:
+        """현재 터미널에서 운영자 입력을 기다리고 있는지 반환한다."""
+        return self._prompt_active.is_set()
+
     def close(self) -> None:
         """채널 종료를 요청한다.
 
@@ -55,22 +60,26 @@ class TerminalRegistrationChannel:
         Args: request: RegistrationRequest. FIFO에서 활성화된 유일한 등록 요청.
         Returns: None. 결과는 내부 ``Queue[RegistrationResponse]``로 전달한다.
         """
-        print(
-            f"registration_prompt_active code={request.display_code} track_id={request.track_id}",
-            flush=True,
-        )
-        answer = self._read_answer(request.display_code)
-        if answer is None:
-            self._responses.put(RegistrationResponse(request.proposal_id, "CANCELLED"))
-            return
-        if answer == "N":
-            self._responses.put(RegistrationResponse(request.proposal_id, "REJECTED"))
-            return
-        name = self._read_name(request.display_code)
-        if name is None:
-            self._responses.put(RegistrationResponse(request.proposal_id, "CANCELLED"))
-            return
-        self._responses.put(RegistrationResponse(request.proposal_id, "REGISTER", name))
+        self._prompt_active.set()
+        try:
+            print(
+                f"registration_prompt_active code={request.display_code} track_id={request.track_id}",
+                flush=True,
+            )
+            answer = self._read_answer(request.display_code)
+            if answer is None:
+                self._responses.put(RegistrationResponse(request.proposal_id, "CANCELLED"))
+                return
+            if answer == "N":
+                self._responses.put(RegistrationResponse(request.proposal_id, "REJECTED"))
+                return
+            name = self._read_name(request.display_code)
+            if name is None:
+                self._responses.put(RegistrationResponse(request.proposal_id, "CANCELLED"))
+                return
+            self._responses.put(RegistrationResponse(request.proposal_id, "REGISTER", name))
+        finally:
+            self._prompt_active.clear()
 
     def _read_answer(self, display_code: str) -> str | None:
         """대소문자와 무관한 Y/N 값이 입력될 때까지 현재 요청만 기다린다.

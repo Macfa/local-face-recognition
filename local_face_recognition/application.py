@@ -184,6 +184,8 @@ class VisionApplication:
             data_root / "face-crops",
         )
         self._repository.initialize()
+        self._operational_log_path = data_root / "operational.log"
+        self._operational_log_lock = Lock()
         self._observation_service = ObservationService(self._repository, IdentityPolicy())
         self._registration_service = RegistrationService(self._repository)
         self._face_sample_service = FaceSampleService(self._repository, self._observation_service)
@@ -304,11 +306,19 @@ class VisionApplication:
                         self._storage_queue.put(_TrackStorageRequest(event, storage_track_id))
                     elif event.kind == "TRACK_ASSOCIATION_UNCERTAIN":
                         self._restart_uncertain_observation(event)
-                # 2. 확정 대상별 얼굴 분석과 중복 차단을 수행하고 통과 표본만 저장으로 넘긴다.
-                for person in people:
-                    overlay = self._analyze_face_if_due(frame, person, occurred_at)
+                # 2. 프레임 전체 얼굴을 사람 Track에 일대일 귀속한 뒤, 기한이 된 대상만 분석한다.
+                due_people = [person for person in people if self._face_analysis_is_due(person.internal_id)]
+                face_candidates = self._face_analyzer.assign_faces(frame, people, occurred_at) if due_people else {}
+                for person in due_people:
+                    overlay = self._analyze_assigned_face(
+                        frame,
+                        person,
+                        face_candidates.get(person.internal_id),
+                    )
                     if overlay is not None:
                         self._analysis_faces[person.internal_id] = overlay
+                    else:
+                        self._analysis_faces.pop(person.internal_id, None)
                 snapshot = [(person, self._samples.count(person.internal_id)) for person in people]
                 with self._snapshot_lock:
                     self._latest_people = snapshot
@@ -360,7 +370,9 @@ class VisionApplication:
                                 flush=True,
                             )
                             continue
-                        print(f"identity_result=applied track_id={item.candidate.track_id} status={result.status}", flush=True)
+                        self._log_analysis_message(
+                            f"identity_result=applied track_id={item.candidate.track_id} status={result.status}"
+                        )
                         if result.proposal_id is not None:
                             # 3. 임시 인물 등록 제안은 FIFO 등록 조율기로 넘긴다.
                             self._request_registration(item.candidate.track_id, item.storage_track_id, result.proposal_id)
@@ -458,68 +470,78 @@ class VisionApplication:
                 self._registration_coordinator.complete(request.proposal_id)
         self._registration_channel.close()
 
-    def _analyze_face_if_due(
+    def _face_analysis_is_due(self, track_id: int) -> bool:
+        """현재 관찰 세션이 표본을 더 받아야 하고 분석 간격이 지났는지 확인한다."""
+        if self._is_identity_finalized(track_id):
+            return False
+        now = monotonic()
+        if now - self._last_face_attempt_at.get(track_id, 0.0) < 0.8:
+            return False
+        self._last_face_attempt_at[track_id] = now
+        return True
+
+    def _log_analysis_message(self, message: str) -> None:
+        """등록 입력 중에는 고빈도 분석 로그를 로컬 파일로 보내 프롬프트를 보존한다."""
+        if not self._registration_channel.is_prompt_active():
+            print(message, flush=True)
+            return
+        try:
+            with self._operational_log_lock:
+                with self._operational_log_path.open("a", encoding="utf-8") as output:
+                    output.write(f"{datetime.now(timezone.utc).isoformat()} {message}\n")
+        except OSError as error:
+            _log_operational_failure("analysis_log", error)
+
+    def _analyze_assigned_face(
         self,
         frame: np.ndarray,
         person: TrackedPerson,
-        occurred_at: datetime,
+        candidate: FaceCandidate | None,
     ) -> _FaceOverlay | None:
-        """일정 간격으로 한 추적 대상의 얼굴 후보와 표본 생성 가능 여부를 처리한다."""
-        if self._is_identity_finalized(person.internal_id):
-            return None
-        now = monotonic()
-        if now - self._last_face_attempt_at.get(person.internal_id, 0.0) < 0.8:
-            return None
-        self._last_face_attempt_at[person.internal_id] = now
-        candidate = self._face_analyzer.find_largest_face(frame, person, occurred_at)
+        """사람 Track에 유일하게 귀속된 얼굴 후보만 품질·임베딩·저장으로 처리한다."""
         if candidate is None:
-            print(f"track_id={person.internal_id} face_candidate=not_detected", flush=True)
+            self._log_analysis_message(f"track_id={person.internal_id} face_candidate=not_detected")
             return None
-        print(
+        self._log_analysis_message(
             f"track_id={person.internal_id} face_candidate=extracted "
             f"detection_score={candidate.detection_score:.3f} yaw_proxy={candidate.yaw_proxy:.3f} "
             f"yaw={candidate.yaw_degrees:.1f} pitch={candidate.pitch_degrees:.1f} "
             f"roll={candidate.roll_degrees:.1f} "
             f"bbox={candidate.bbox}",
-            flush=True,
         )
         quality = self._quality_evaluator.evaluate(frame, candidate)
-        print(
+        self._log_analysis_message(
             f"track_id={person.internal_id} face_quality=evaluated accepted={quality.accepted} "
             f"score={quality.score:.3f} reason={quality.reason} size={quality.face_size} "
             f"sharpness={quality.sharpness:.1f} brightness={quality.brightness:.1f} "
             f"occlusion_probability={quality.occlusion_probability:.3f}",
-            flush=True,
         )
         overlay = _FaceOverlay(candidate.bbox, quality.reason, quality.accepted)
         if not quality.accepted:
-            print(f"track_id={person.internal_id} face_sample=not_created", flush=True)
+            self._log_analysis_message(f"track_id={person.internal_id} face_sample=not_created")
             return overlay
         try:
             embedding = self._face_embedding.embed(frame, candidate)
         except Exception as error:
-            print(
+            self._log_analysis_message(
                 f"track_id={person.internal_id} face_embedding=failed "
                 f"error={type(error).__name__}",
-                flush=True,
             )
             return overlay
-        print(f"track_id={person.internal_id} face_embedding=created", flush=True)
+        self._log_analysis_message(f"track_id={person.internal_id} face_embedding=created")
         saved, similarity, duplicate_reason = self._samples.add_if_non_duplicate(candidate, embedding, quality)
         if not saved:
-            print(
+            self._log_analysis_message(
                 f"track_id={person.internal_id} face_sample=duplicate "
                 f"reason={duplicate_reason} similarity={similarity:.4f}",
-                flush=True,
             )
             return overlay
         similarity_text = "none" if similarity is None else f"{similarity:.4f}"
         sample_number = self._samples.count(person.internal_id)
-        print(
+        self._log_analysis_message(
             f"track_id={person.internal_id} face_sample=extracted_success "
             f"sample_number={sample_number} quality={quality.score:.3f} "
             f"max_existing_similarity={similarity_text}",
-            flush=True,
         )
         left, top, right, bottom = candidate.bbox
         self._start_storage_work(person.internal_id)

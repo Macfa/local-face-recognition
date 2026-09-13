@@ -131,6 +131,10 @@ class RegistrationChannel(Protocol):
         """제한 시간 안에 도착한 응답을 반환하고 없으면 ``None``을 반환한다."""
         ...
 
+    def is_prompt_active(self) -> bool:
+        """사람이 읽고 응답해야 하는 등록 질문이 현재 표시 중인지 반환한다."""
+        ...
+
     def close(self) -> None:
         """채널이 보유한 로컬 리소스를 종료한다."""
         ...

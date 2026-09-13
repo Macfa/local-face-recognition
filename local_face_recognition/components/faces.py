@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -16,8 +18,21 @@ from insightface.utils import face_align
 from .types import FaceCandidate, FaceQuality, MemoryFaceSample, TrackedPerson
 
 
+@dataclass(frozen=True)
+class _DetectedFace:
+    """한 프레임 전체에서 검출한 얼굴의 전역 좌표와 분석 메타데이터다."""
+
+    bbox: Tuple[int, int, int, int]
+    detection_score: float
+    landmarks: np.ndarray
+    yaw_proxy: float
+    yaw_degrees: float
+    pitch_degrees: float
+    roll_degrees: float
+
+
 class FaceAnalyzer:
-    """확정 사람 영역에서 가장 큰 얼굴·랜드마크·자세를 추출하는 로컬 InsightFace 컴포넌트."""
+    """프레임 얼굴을 사람 Track에 일대일로 귀속하는 로컬 InsightFace 컴포넌트."""
 
     def __init__(self, model_root: Path) -> None:
         """CPU 얼굴 검출 모델을 연다.
@@ -37,51 +52,128 @@ class FaceAnalyzer:
         )
         self._analysis.prepare(ctx_id=0, det_size=(640, 640))
 
-    def find_largest_face(
+    def assign_faces(
         self,
         frame: np.ndarray,
-        person: TrackedPerson,
+        people: List[TrackedPerson],
         captured_at: datetime,
-    ) -> FaceCandidate | None:
-        """사람 BBox 안의 가장 큰 얼굴을 FaceCandidate로 반환한다.
+    ) -> Dict[int, FaceCandidate]:
+        """프레임의 얼굴을 최대 하나의 사람 Track에만 귀속해 FaceCandidate로 반환한다.
 
-        Args: frame: np.ndarray BGR 프레임; person: TrackedPerson 대상; captured_at: datetime 관측 시각.
-        Returns: FaceCandidate | None. 얼굴·랜드마크·자세 또는 미검출 None.
+        큰 사람 상자 안에 두 얼굴이 들어와도 같은 얼굴을 두 Track에 반환하지 않는다. 얼굴이
+        여러 사람 상자에 비슷하게 잘 맞으면 안전하게 어느 Track에도 귀속하지 않는다.
+
+        Args: frame: np.ndarray BGR 프레임; people: List[TrackedPerson] 현재 확정 Track; captured_at: datetime 관측 시각.
+        Returns: Dict[int, FaceCandidate]. 내부 Track ID별 유일하게 귀속된 얼굴 후보.
         """
         frame_height, frame_width = frame.shape[:2]
-        left, top, right, bottom = self._clip_bbox(person.bbox, frame_width, frame_height)
-        person_crop = frame[top:bottom, left:right]
-        faces = self._analysis.get(person_crop) if person_crop.size else []
-        if not faces:
-            return None
+        faces = [self._to_detected_face(face, frame_width, frame_height) for face in self._analysis.get(frame)]
+        faces = [face for face in faces if face is not None]
+        if not people or not faces:
+            return {}
+        scores = tuple(
+            tuple(self._person_face_score(person.bbox, face.bbox) for face in faces)
+            for person in people
+        )
+        ambiguous_face_indexes = self._ambiguous_face_indexes(scores)
+        assignments = self._globally_assign_faces(scores, ambiguous_face_indexes)
+        return {
+            people[person_index].internal_id: self._to_candidate(
+                people[person_index].internal_id,
+                faces[face_index],
+                captured_at,
+            )
+            for person_index, face_index in assignments.items()
+        }
 
-        face = max(
-            faces,
-            key=lambda value: float((value.bbox[2] - value.bbox[0]) * (value.bbox[3] - value.bbox[1])),
-        )
-        face_left, face_top, face_right, face_bottom = (int(value) for value in face.bbox)
-        bbox = self._clip_bbox(
-            (left + face_left, top + face_top, left + face_right, top + face_bottom),
-            frame_width,
-            frame_height,
-        )
+    def _to_detected_face(
+        self,
+        face: object,
+        frame_width: int,
+        frame_height: int,
+    ) -> _DetectedFace | None:
+        """InsightFace 결과를 전역 좌표의 내부 얼굴 DTO로 정규화한다."""
+        bbox = self._clip_bbox(tuple(int(value) for value in face.bbox), frame_width, frame_height)
         if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
             return None
+        landmarks = np.asarray(face.kps, dtype=np.float32)
+        pitch, yaw, roll = (float(value) for value in np.asarray(face.pose, dtype=np.float32))
+        return _DetectedFace(bbox, float(face.det_score), landmarks, self._yaw_proxy(landmarks), yaw, pitch, roll)
 
-        local_landmarks = np.asarray(face.kps, dtype=np.float32)
-        yaw_proxy = self._yaw_proxy(local_landmarks)
-        pose = np.asarray(face.pose, dtype=np.float32)
-        pitch, yaw, roll = (float(value) for value in pose)
-        global_landmarks = local_landmarks + np.array([left, top], dtype=np.float32)
+    @staticmethod
+    def _person_face_score(person_bbox: Tuple[int, int, int, int], face_bbox: Tuple[int, int, int, int]) -> float | None:
+        """사람 상자 안에 자연스럽게 포함된 얼굴에만 귀속 점수를 부여한다."""
+        person_left, person_top, person_right, person_bottom = person_bbox
+        face_left, face_top, face_right, face_bottom = face_bbox
+        face_area = max(0, face_right - face_left) * max(0, face_bottom - face_top)
+        overlap_area = max(0, min(person_right, face_right) - max(person_left, face_left)) * max(
+            0,
+            min(person_bottom, face_bottom) - max(person_top, face_top),
+        )
+        if face_area == 0 or overlap_area / face_area < 0.90:
+            return None
+        center_y = (face_top + face_bottom) / 2.0
+        person_height = max(1, person_bottom - person_top)
+        relative_height = (center_y - person_top) / person_height
+        if relative_height > 0.78:
+            return None
+        return overlap_area / face_area + (1.0 - relative_height) * 0.20
+
+    @staticmethod
+    def _ambiguous_face_indexes(scores: Tuple[Tuple[float | None, ...], ...]) -> set[int]:
+        """둘 이상의 사람 상자에 거의 같은 점수로 속한 얼굴 인덱스를 반환한다."""
+        if not scores:
+            return set()
+        ambiguous = set()
+        for face_index in range(len(scores[0])):
+            matches = sorted(
+                (score for person_scores in scores if (score := person_scores[face_index]) is not None),
+                reverse=True,
+            )
+            if len(matches) >= 2 and matches[0] - matches[1] < 0.15:
+                ambiguous.add(face_index)
+        return ambiguous
+
+    @staticmethod
+    def _globally_assign_faces(
+        scores: Tuple[Tuple[float | None, ...], ...],
+        ambiguous_face_indexes: set[int],
+    ) -> Dict[int, int]:
+        """유효하고 비모호한 얼굴만 사람 Track에 일대일로 최대 점수 배정한다."""
+        @lru_cache(maxsize=None)
+        def choose(person_index: int, used_mask: int) -> Tuple[float, Tuple[int | None, ...]]:
+            if person_index == len(scores):
+                return 0.0, ()
+            best_score, tail = choose(person_index + 1, used_mask)
+            best_assignment: Tuple[int | None, ...] = (None,) + tail
+            for face_index, score in enumerate(scores[person_index]):
+                if face_index in ambiguous_face_indexes or score is None or used_mask & (1 << face_index):
+                    continue
+                next_score, next_tail = choose(person_index + 1, used_mask | (1 << face_index))
+                if score + next_score > best_score:
+                    best_score = score + next_score
+                    best_assignment = (face_index,) + next_tail
+            return best_score, best_assignment
+
+        _, selected = choose(0, 0)
+        return {
+            person_index: face_index
+            for person_index, face_index in enumerate(selected)
+            if face_index is not None
+        }
+
+    @staticmethod
+    def _to_candidate(track_id: int, face: _DetectedFace, captured_at: datetime) -> FaceCandidate:
+        """일대일 귀속이 확정된 내부 얼굴 결과를 외부 FaceCandidate DTO로 만든다."""
         return FaceCandidate(
-            person.internal_id,
-            bbox,
-            float(face.det_score),
-            global_landmarks,
-            yaw_proxy,
-            yaw,
-            pitch,
-            roll,
+            track_id,
+            face.bbox,
+            face.detection_score,
+            face.landmarks,
+            face.yaw_proxy,
+            face.yaw_degrees,
+            face.pitch_degrees,
+            face.roll_degrees,
             captured_at,
         )
 

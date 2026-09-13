@@ -9,8 +9,11 @@ flowchart TD
     T --> P[TRACK_CONFIRMED]
     P --> PT[PersonTrack 생성 또는 갱신]
     PT --> S[ObservationSession 생성 또는 유지]
-    S --> FD[Face Detection]
-    FD --> FC[FaceCandidate: 메모리]
+    S --> FD[Frame Face Detection 1회]
+    FD --> FA[Face-to-Track 일대일 귀속]
+    FA -->|귀속 불확실| N[다음 프레임]
+    FA -->|유일 귀속| FC
+    FC[FaceCandidate: 메모리]
     FC --> Q[Face Quality Evaluation]
     Q -->|허용| E[Face Embedding]
     Q -->|거부| N[다음 프레임]
@@ -48,6 +51,9 @@ flowchart TD
 한 번에 하나의 활성 요청만 전달한다. 현재 요청의 Y/N과 이름 입력이 완료돼야 다음 요청을
 묻는다. Telegram은 같은 `RegistrationChannel` 포트를 구현하는 추가 어댑터이며, 도메인 등록
 규칙과 FIFO 순서는 바꾸지 않는다.
+
+Terminal 등록 질문이 활성화된 동안 표본·품질·임베딩 같은 고빈도 분석 로그는 콘솔 출력 대신
+로컬 `operational.log`에 남긴다. 등록 질문과 Y/N·이름 입력은 계속 콘솔의 활성 화면에 남는다.
 | LOST 후 10분 경과 + 진행 작업 완료 | Track 종료 | 세션 종료 |
 
 추적 컴포넌트는 같은 내부 ID가 연속 확인 프레임 수를 채워야 `TRACK_CONFIRMED`를 낸다.
