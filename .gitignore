@@ -1,14 +1,3 @@
-.DS_Store
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.env
 .venv/
-venv/
-.build-venv/
-.insightface-buffalo-l.zip
-data/
-models/
+__pycache__/
+*.pyc
