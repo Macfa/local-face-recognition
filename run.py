@@ -1,3 +1,5 @@
+"""실행 환경을 검증하고 가상환경의 Python으로 애플리케이션을 시작한다."""
+
 from __future__ import annotations
 
 import os
@@ -109,10 +111,18 @@ def _run_application() -> None:
 
 
 def main() -> None:
+    """환경 준비 단계를 순서대로 통과한 경우에만 main.py를 실행한다."""
+    # 1단계: 현재 Python이 프로젝트의 최소 실행 버전을 만족하는지 확인한다.
     _check_current_python()
+
+    # 2단계: 프로젝트 가상환경과 가상환경 Python의 유효성을 확인한다.
     _check_virtual_environment()
+
+    # 3단계: requirements.txt에 선언된 정확한 버전을 설치·확인한다.
     _ensure_requirements()
     print("runtime_ready=true", flush=True)
+
+    # 4단계: 모든 준비가 끝난 뒤 실제 애플리케이션 진입점을 호출한다.
     _run_application()
 
 
